@@ -7,6 +7,7 @@ import { createAdminIpcCaller, type AdminIpcCaller } from '../admin/ipc';
 import { AdminWriteError } from '../admin/ops';
 import { createAdminService } from '../admin/service';
 import { installBackendDep, uninstallBackendDep } from '../agent';
+import type { ModelInfo } from '../agent/types';
 import { spawnDaemonControl } from '../cli/commands/daemon-control';
 import { mountWebConsole } from '../web/mount';
 
@@ -153,6 +154,12 @@ export async function runSupervisor(bots: BotEntry[]): Promise<void> {
         if (!c) throw new AdminWriteError(`机器人「${botId}」不在本次启动的活跃集里（先 \`bot use\` 勾选后重启）。`);
         if (!c.proc || !c.ipc) throw new AdminWriteError(`机器人「${c.bot.name}」进程未在运行（崩溃重启中），稍后重试。`);
         await c.ipc.call(op);
+      },
+      listProjectModels: async (botId, projectName): Promise<ModelInfo[]> => {
+        const c = byAppId(botId);
+        if (!c) throw new AdminWriteError(`机器人「${botId}」不在本次启动的活跃集里（先 \`bot use\` 勾选后重启）。`);
+        if (!c.proc || !c.ipc) throw new AdminWriteError(`机器人「${c.bot.name}」进程未在运行（崩溃重启中），稍后重试。`);
+        return (await c.ipc.call({ kind: 'listProjectModels', project: projectName })) as ModelInfo[];
       },
       liveStatus: async (botId) => {
         const c = byAppId(botId);

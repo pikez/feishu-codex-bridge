@@ -47,7 +47,7 @@ import {
   type InstallResult,
   type InstallProgress,
 } from '../agent';
-import type { BackendDepState, BackendProbe, PermissionMode } from '../agent/types';
+import type { BackendDepState, BackendProbe, ModelInfo, PermissionMode, ReasoningEffort } from '../agent/types';
 import { readRecentLogs } from '../core/logger';
 import { getServiceAdapter } from '../service/adapter';
 import {
@@ -74,6 +74,7 @@ import type { AdminWriteOp } from './ops';
  *       setPermissionMode   ← dm.proj.perm.submit（🔐 权限 · 保存）
  *       setNoMention        ← dm.proj.noMention（✋ 免@）
  *       setAutoCompact      ← dm.proj.autoCompact（🗜️ 自动压缩）
+ *       setModelDefault     ← dm.proj.modelDefault.submit（🤖 默认模型 / 推理强度）
  *       setCompletionReminder ← dm.set.completionReminder（🔔 完成提醒）
  *       doctorBackends      ← dm.doctor 的后端探测段（🩺 诊断）
  *       eventDiagnosis      ← dm.doctor 的事件订阅三态段（M-7）
@@ -111,6 +112,14 @@ export interface AdminService {
   setNoMention(botId: string, projectName: string, on: boolean): Promise<void>;
   /** 🗜️ 自动压缩开关（写），含驱逐活跃会话的既有语义。 */
   setAutoCompact(botId: string, projectName: string, on: boolean): Promise<void>;
+  /** 项目后端的实时模型目录；用于 Web 默认模型选择器。 */
+  listProjectModels(botId: string, projectName: string): Promise<ModelInfo[]>;
+  /** 🤖 设置项目新话题默认模型 / 推理强度（写）；不影响既有话题。 */
+  setModelDefault(
+    botId: string,
+    projectName: string,
+    opts: { model: string; effort?: ReasoningEffort },
+  ): Promise<void>;
   /** 🔔 每 bot 的普通任务结束提醒（写）；经 bot 进程落盘并热更新 LIVE cfg。 */
   setCompletionReminder(
     botId: string,
@@ -299,6 +308,10 @@ export interface AdminProject {
   network: boolean;
   /** effective 后端 id（显式 backend ?? 智能默认 effectiveDefaultBackend，与运行时路由同源） */
   backend: string;
+  /** 项目显式设定的新话题默认模型；未设时由后端选择默认模型。 */
+  defaultModel?: string;
+  /** 项目显式设定的新话题默认推理强度。 */
+  defaultEffort?: ReasoningEffort;
   allowedUsersCount: number;
   /** 🧵 话题数（该群名下的会话记录数） */
   sessionCount: number;
@@ -418,6 +431,8 @@ export interface AdminServiceDeps {
   /** 写执行器：botId + op → 完成或抛 AdminWriteError（校验拒绝）。
    * 缺省 = 只读预览，写方法抛 {@link NotWiredYetError}（HTTP 501）。 */
   executeWrite?: (botId: string, op: AdminWriteOp) => Promise<void>;
+  /** 在拥有 bot 运行态的进程中读取项目后端的实时模型目录。缺省时 Web 预览不能展示选择器。 */
+  listProjectModels?: (botId: string, projectName: string) => Promise<ModelInfo[]>;
   /** 实时运行状态（daemon 进程内：本进程 channel / 子进程 IPC）。返回 undefined
    * 或缺省 → 回退锁文件探测（该 bot 不归本 daemon 管，如未激活的 bot）。 */
   liveStatus?: (botId: string) => Promise<BotLiveStatus | undefined>;
@@ -488,6 +503,8 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       guestMode: effectiveGuestMode(p),
       network: p.network ?? false,
       backend: p.backend ?? defaultBackend,
+      defaultModel: p.defaultModel,
+      defaultEffort: p.defaultEffort,
       allowedUsersCount: p.allowedUsers?.length ?? 0,
       sessionCount: p.chatId ? (countByChat.get(p.chatId) ?? 0) : 0,
       createdAt: p.createdAt,
@@ -600,6 +617,24 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
 
     async setAutoCompact(botId: string, projectName: string, on: boolean): Promise<void> {
       await executeWrite(botId, '🗜️ 自动压缩开关', { kind: 'setAutoCompact', project: projectName, on });
+    },
+
+    async listProjectModels(botId: string, projectName: string): Promise<ModelInfo[]> {
+      if (!deps.listProjectModels) throw new NotWiredYetError('🤖 获取实时模型列表');
+      return deps.listProjectModels(botId, projectName);
+    },
+
+    async setModelDefault(
+      botId: string,
+      projectName: string,
+      opts: { model: string; effort?: ReasoningEffort },
+    ): Promise<void> {
+      await executeWrite(botId, '🤖 设置默认模型', {
+        kind: 'setModelDefault',
+        project: projectName,
+        model: opts.model,
+        effort: opts.effort,
+      });
     },
 
     async setCompletionReminder(

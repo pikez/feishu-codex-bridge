@@ -48,6 +48,7 @@ export type AdminWriteOp =
     }
   | { kind: 'setNoMention'; project: string; on: boolean }
   | { kind: 'setAutoCompact'; project: string; on: boolean }
+  | { kind: 'setModelDefault'; project: string; model: string; effort?: ReasoningEffort }
   | {
       kind: 'setCompletionReminder';
       mode: CompletionReminderMode;
@@ -422,6 +423,17 @@ export async function runAdminWriteOp(
         on: op.on,
         evictLiveSessionsForChat: deps.evictLiveSessionsForChat,
       });
+    case 'setModelDefault': {
+      const project = await getProjectByName(op.project);
+      if (!project) return { ok: false, reason: `项目「${op.project}」不存在` };
+      const models = await deps.backendFor(project.backend).listModels();
+      const model = models.find((candidate) => candidate.id === op.model && !candidate.hidden);
+      if (!model) return { ok: false, reason: '所选模型无效或已下架，未保存。' };
+      const supported = model.supportedEfforts ?? [];
+      const effort =
+        op.effort && supported.includes(op.effort) ? op.effort : supported.length ? model.defaultEffort : undefined;
+      return performSetModelDefault({ projectName: project.name, model: model.id, effort });
+    }
     case 'setCompletionReminder':
       if (!deps.cfg) return { ok: false, reason: 'bot 运行配置不可用，无法即时更新完成提醒' };
       return performSetCompletionReminder({

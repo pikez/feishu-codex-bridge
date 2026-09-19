@@ -21,6 +21,7 @@ import {
 import type { SelectOption } from '../card/cards';
 import {
   createAppPreferencesWriter,
+  AdminWriteError,
   createAdminWriteExecutor,
   performBackendSwitch,
   performSetAutoCompact,
@@ -506,10 +507,12 @@ export interface Orchestrator {
   /** application.bot.menu_v6（raw-tap）：bot 单聊菜单点击 → DM 管理台菜单卡。 */
   onBotMenu: (evt: { openId?: string; eventKey?: string; eventId?: string }) => Promise<void>;
   dispatcher: CardDispatcher;
-  /** 进程内管理写面（Web 控制台 / supervisor IPC 共用）：四个写操作走与 DM
+  /** 进程内管理写面（Web 控制台 / supervisor IPC 共用）：项目与 bot 设置写操作走与 DM
    * 卡片回调完全同一套共享函数（admin/ops.ts），含同样的校验与活跃会话驱逐；
    * 校验拒绝抛 AdminWriteError（HTTP 409 / IPC code 还原）。 */
   adminExecute: (op: AdminWriteOp) => Promise<void>;
+  /** 返回项目后端的实时模型目录，供 Web 默认模型选择器使用。 */
+  adminListProjectModels: (projectName: string) => Promise<ModelInfo[]>;
   /** Close every live codex session (SIGKILLs the app-server children) so a
    *  graceful exit leaves no orphan processes. */
   shutdown: () => Promise<void>;
@@ -5367,7 +5370,24 @@ export function createOrchestrator(
     if (op.kind === 'setCompletionReminder') refreshCompletionReminderCards();
   };
 
-  return { onMessage, onComment, onBotAddedToChat, onBotRemovedFromChat, onReaction, onBotMenu, dispatcher, adminExecute, shutdown };
+  const adminListProjectModels = async (projectName: string): Promise<ModelInfo[]> => {
+    const project = await getProjectByName(projectName);
+    if (!project) throw new AdminWriteError(`项目「${projectName}」不存在`);
+    return listModels(backendFor(project.backend));
+  };
+
+  return {
+    onMessage,
+    onComment,
+    onBotAddedToChat,
+    onBotRemovedFromChat,
+    onReaction,
+    onBotMenu,
+    dispatcher,
+    adminExecute,
+    adminListProjectModels,
+    shutdown,
+  };
 }
 
 /** Resolve a message's thread_id via raw API (reply response omits it). The

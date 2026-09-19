@@ -85,6 +85,8 @@ beforeAll(async () => {
     kind: 'multi',
     mode: 'write',
     backend: 'codex-appserver',
+    defaultModel: 'gpt-5.5',
+    defaultEffort: 'high',
     allowedUsers: ['ou_1'],
   });
   // 每 bot 的全局偏好来自各自 config.json；A 关闭发信人身份，B 保持默认开启。
@@ -165,6 +167,8 @@ describe('createReadonlyAdminService · 只读方法（显式路径，不碰全�
     expect(p.autoCompact).toBe(true);
     expect(p.network).toBe(false);
     expect(p.backend).toBe('codex-appserver'); // 显式设的后端原样透传
+    expect(p.defaultModel).toBe('gpt-5.5');
+    expect(p.defaultEffort).toBe('high');
     expect(p.allowedUsersCount).toBe(1);
     expect(p.sessionCount).toBe(2); // oc_other 的 t3 不算
   });
@@ -207,12 +211,14 @@ describe('createReadonlyAdminService · 只读方法（显式路径，不碰全�
   });
 });
 
-describe('createReadonlyAdminService · 写方法（只读预览占位）', () => {
-  it('六个写方法一律抛 NotWiredYetError', async () => {
+describe('createReadonlyAdminService · 运行态模型与写方法（只读预览占位）', () => {
+  it('实时模型读取与七个写方法一律抛 NotWiredYetError', async () => {
     await expect(service.switchBackend(BOT_A, 'proj-a', 'codex-appserver')).rejects.toBeInstanceOf(NotWiredYetError);
     await expect(service.setPermissionMode(BOT_A, 'proj-a', { mode: 'qa' })).rejects.toBeInstanceOf(NotWiredYetError);
     await expect(service.setNoMention(BOT_A, 'proj-a', true)).rejects.toBeInstanceOf(NotWiredYetError);
     await expect(service.setAutoCompact(BOT_A, 'proj-a', false)).rejects.toBeInstanceOf(NotWiredYetError);
+    await expect(service.listProjectModels(BOT_A, 'proj-a')).rejects.toBeInstanceOf(NotWiredYetError);
+    await expect(service.setModelDefault(BOT_A, 'proj-a', { model: 'gpt-5.5', effort: 'high' })).rejects.toBeInstanceOf(NotWiredYetError);
     await expect(
       service.setCompletionReminder(BOT_A, { mode: 'failures', longTaskMinutes: 3 }),
     ).rejects.toBeInstanceOf(NotWiredYetError);
@@ -233,11 +239,23 @@ describe('createAdminService · daemon 进程内（executeWrite + liveStatus 注
     const calls: { botId: string; op: AdminWriteOp }[] = [];
     const daemon = createAdminService({
       executeWrite: async (botId, op) => void calls.push({ botId, op }),
+      listProjectModels: async () => [
+        {
+          id: 'gpt-5.5',
+          displayName: 'GPT-5.5',
+          description: '',
+          supportedEfforts: ['high'],
+          defaultEffort: 'high',
+          isDefault: true,
+          hidden: false,
+        },
+      ],
     });
     await daemon.switchBackend(BOT_A, 'proj-a', 'codex-appserver');
     await daemon.setPermissionMode(BOT_A, 'proj-a', { mode: 'qa', guestMode: 'write', network: true });
     await daemon.setNoMention(BOT_A, 'proj-a', false);
     await daemon.setAutoCompact(BOT_A, 'proj-a', true);
+    await daemon.setModelDefault(BOT_A, 'proj-a', { model: 'gpt-5.5', effort: 'high' });
     await daemon.setCompletionReminder(BOT_A, { mode: 'long', longTaskMinutes: 8 });
     await daemon.setSenderIdentity(BOT_A, false);
     expect(calls).toEqual([
@@ -248,9 +266,11 @@ describe('createAdminService · daemon 进程内（executeWrite + liveStatus 注
       },
       { botId: BOT_A, op: { kind: 'setNoMention', project: 'proj-a', on: false } },
       { botId: BOT_A, op: { kind: 'setAutoCompact', project: 'proj-a', on: true } },
+      { botId: BOT_A, op: { kind: 'setModelDefault', project: 'proj-a', model: 'gpt-5.5', effort: 'high' } },
       { botId: BOT_A, op: { kind: 'setCompletionReminder', mode: 'long', longTaskMinutes: 8 } },
       { botId: BOT_A, op: { kind: 'setSenderIdentity', on: false } },
     ]);
+    await expect(daemon.listProjectModels(BOT_A, 'proj-a')).resolves.toMatchObject([{ id: 'gpt-5.5' }]);
   });
 
   it('执行器抛 AdminWriteError（校验拒绝）原样透传给调用方', async () => {

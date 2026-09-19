@@ -61,6 +61,12 @@ function stubService(): AdminService {
     async setAutoCompact() {
       throw new NotWiredYetError('🗜️ 自动压缩开关');
     },
+    async listProjectModels() {
+      throw new NotWiredYetError('🤖 获取实时模型列表');
+    },
+    async setModelDefault() {
+      throw new NotWiredYetError('🤖 设置默认模型');
+    },
     async setCompletionReminder() {
       throw new NotWiredYetError('🔔 完成提醒');
     },
@@ -379,6 +385,46 @@ describe('web server · 只读 API', () => {
     expect(body.sessions[0].summary).toBe('修复登录 bug');
   });
 
+  it('/api/project/:name/models：返回该项目后端的实时可选模型', async () => {
+    const svc = stubService();
+    svc.listProjectModels = async (botId, project) => {
+      expect(botId).toBe('cli_a');
+      expect(project).toBe('demo');
+      return [
+        {
+          id: 'gpt-5.5',
+          displayName: 'GPT-5.5',
+          description: '',
+          supportedEfforts: ['low', 'high'],
+          defaultEffort: 'high',
+          isDefault: true,
+          hidden: false,
+        },
+      ];
+    };
+    const server = createWebServer({ service: svc, token: TOKEN, logDir });
+    const { port } = await server.listen(0);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/project/demo/models`, {
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      });
+      expect(res.status).toBe(200);
+      expect((await jsonOf(res)).models).toEqual([
+        {
+          id: 'gpt-5.5',
+          displayName: 'GPT-5.5',
+          description: '',
+          supportedEfforts: ['low', 'high'],
+          defaultEffort: 'high',
+          isDefault: true,
+          hidden: false,
+        },
+      ]);
+    } finally {
+      await server.close();
+    }
+  });
+
   it('未知路径 → 404', async () => {
     expect((await authed('/api/nope')).status).toBe(404);
   });
@@ -414,7 +460,7 @@ describe('web server · 只读 API', () => {
 });
 
 describe('web server · 写操作占位（只读预览：daemon 未跑）', () => {
-  it.each(['backend', 'permission', 'no-mention', 'auto-compact'])('POST /api/project/demo/%s → 501', async (action) => {
+  it.each(['backend', 'permission', 'no-mention', 'auto-compact', 'model-default'])('POST /api/project/demo/%s → 501', async (action) => {
     const res = await authed(`/api/project/demo/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -467,6 +513,9 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
     svc.setNoMention = async () => {
       throw new AdminWriteError('项目「demo」不存在');
     };
+    svc.setModelDefault = async (botId, project, value) => {
+      written.push({ botId, project, modelDefault: value });
+    };
     svc.setCompletionReminder = async (botId, value) => {
       written.push({ botId, completionReminder: value });
     };
@@ -503,6 +552,21 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
     const body = await jsonOf(res);
     expect(body.error).toBe('write_rejected');
     expect(body.message).toContain('不存在');
+  });
+
+  it('默认模型保存 → 200，并把模型和推理强度交给 service', async () => {
+    const res = await fetch(`${writeBase}/api/project/demo/model-default?bot=cli_a`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5.5', effort: 'high' }),
+    });
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toEqual({ ok: true });
+    expect(written).toContainEqual({
+      botId: 'cli_a',
+      project: 'demo',
+      modelDefault: { model: 'gpt-5.5', effort: 'high' },
+    });
   });
 
   it('完成提醒保存 → 200，并把每 bot 设置交给 service', async () => {

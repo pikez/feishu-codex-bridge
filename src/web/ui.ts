@@ -14,8 +14,8 @@
  * 按路由清空重渲；SSE 日志全程只连一次不随 Tab 断。
  *
  * UI 风格贴飞书 DM 卡片：卡片块 + 圆角 + 标签 + 蓝主按钮（#3370ff），中文文案与
- * src/card/dm-cards.ts 同款 emoji 标签（🧠 后端 / 🔐 权限 / 🩺 诊断 / ✋ 免@ /
- * 🗜️ 自动压缩 / 🧵 话题 / 👥 多话题群 / 💬 单会话群）。
+ * src/card/dm-cards.ts 同款 emoji 标签（🧠 后端 / 🤖 默认模型 / 🔐 权限 / 🩺 诊断 /
+ * ✋ 免@ / 🗜️ 自动压缩 / 🧵 话题 / 👥 多话题群 / 💬 单会话群）。
  */
 
 /**
@@ -611,6 +611,11 @@ export const UI_HTML = `<!doctype html>
     font: 13px var(--mono); background: #0c0e0c; color: var(--text);
   }
   .compact-input:focus { outline: 0; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
+  .compact-select {
+    min-width: 210px; max-width: 100%; border: 1px solid var(--border-2); border-radius: 8px; padding: 7px 9px;
+    font: 13px var(--mono); background: #0c0e0c; color: var(--text);
+  }
+  .compact-select:focus { outline: 0; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-dim); }
   .backend-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
   .backend-row .grow { flex: 1; min-width: 0; }
   .bk-group { margin: 6px 0 2px; }
@@ -2352,6 +2357,82 @@ ${UI_PURE_JS}
     bkRO.appendChild(el('span', 'tag', '🔒 创建时锁定'));
     d.appendChild(bkRO);
     d.appendChild(el('div', 'note', '后端在新建项目时选定，运行时固定、不支持切换。如需更改，请删除该项目后用新后端重新创建。'));
+    d.appendChild(el('hr', 'hr'));
+
+    // 🤖 默认模型 / 推理强度：目录从实际运行该机器人的进程读取，因此与群 /settings
+    // 使用同一份后端实时能力数据；保存只改变之后新建的话题。
+    d.appendChild(el('div', null, '🤖 新话题默认模型 / 推理强度'));
+    var modelBox = el('div', 'note', '加载实时模型…');
+    d.appendChild(modelBox);
+    fetch('/api/project/' + encodeURIComponent(p.name) + '/models?bot=' + encodeURIComponent(currentBotId()))
+      .then(function (r) { return r.json().then(function (j) { return { status: r.status, body: j }; }); })
+      .then(function (resp) {
+        // 抽屉已关闭、切换项目或刷新后重绘时，丢弃旧请求的迟到结果，避免串到另一个项目。
+        if (drawerProject !== p.name || !modelBox.isConnected) return;
+        modelBox.textContent = '';
+        if (resp.status !== 200) {
+          modelBox.textContent = '⚠️ ' + (resp.body.message || '实时模型加载失败');
+          return;
+        }
+        var models = (resp.body.models || []).filter(function (m) { return !m.hidden; });
+        if (models.length === 0) {
+          modelBox.textContent = '当前后端没有返回可选模型。';
+          return;
+        }
+        var initial = models.find(function (m) { return m.id === p.defaultModel; }) ||
+          models.find(function (m) { return m.isDefault; }) || models[0];
+        var modelSelect = el('select', 'compact-select');
+        modelSelect.setAttribute('aria-label', '新话题默认模型');
+        models.forEach(function (m) {
+          var option = el('option', null, m.displayName || m.id);
+          option.value = m.id;
+          if (m.id === initial.id) option.selected = true;
+          modelSelect.appendChild(option);
+        });
+        modelBox.appendChild(el('div', 'note', '🤖 默认模型'));
+        modelBox.appendChild(modelSelect);
+
+        var effortRow = el('div', 'statline');
+        var effortSelect = el('select', 'compact-select');
+        effortSelect.setAttribute('aria-label', '新话题默认推理强度');
+        var effortNames = { none: '无', minimal: '极简', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', ultra: '超强' };
+        function renderEfforts() {
+          var chosen = models.find(function (m) { return m.id === modelSelect.value; }) || initial;
+          var efforts = chosen.supportedEfforts || [];
+          effortRow.textContent = '';
+          if (efforts.length === 0) {
+            effortRow.appendChild(el('span', 'note', '该后端不调节推理强度（由模型自动调度）。'));
+            return;
+          }
+          var preferred = chosen.id === p.defaultModel && efforts.indexOf(p.defaultEffort) >= 0 ? p.defaultEffort : chosen.defaultEffort;
+          effortSelect.textContent = '';
+          efforts.forEach(function (effort) {
+            var option = el('option', null, '强度：' + (effortNames[effort] || effort));
+            option.value = effort;
+            if (effort === preferred) option.selected = true;
+            effortSelect.appendChild(option);
+          });
+          effortRow.appendChild(el('span', 'note', '🧠 默认推理强度'));
+          effortRow.appendChild(effortSelect);
+        }
+        modelSelect.onchange = renderEfforts;
+        renderEfforts();
+        modelBox.appendChild(effortRow);
+
+        var save = el('button', 'btn primary sm', '保存默认模型');
+        save.onclick = function () {
+          var chosen = models.find(function (m) { return m.id === modelSelect.value; });
+          var effort = chosen && (chosen.supportedEfforts || []).length ? effortSelect.value : undefined;
+          postWrite('/api/project/' + encodeURIComponent(p.name) + '/model-default', { model: modelSelect.value, effort: effort });
+        };
+        var modelActions = el('div', 'opt-row');
+        modelActions.appendChild(save);
+        modelBox.appendChild(modelActions);
+        modelBox.appendChild(el('div', 'note', '仅影响之后新建的话题；进行中或已恢复的话题不受影响，话题内仍可用 /model 临时修改。'));
+      })
+      .catch(function () {
+        if (drawerProject === p.name && modelBox.isConnected) modelBox.textContent = '⚠️ 实时模型加载失败';
+      });
     d.appendChild(el('hr', 'hr'));
 
     // ✋ 免@

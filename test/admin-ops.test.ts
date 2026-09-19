@@ -423,6 +423,50 @@ describe('createAdminWriteExecutor / runAdminWriteOp（Web · IPC 入口）', ()
     expect((await getProjectByName('demo'))?.noMention).toBe(false);
   });
 
+  it('setModelDefault：仅接受实时可见模型，并按该模型能力收窄推理强度', async () => {
+    const backend = fakeBackend({
+      listModels: async () => [
+        {
+          id: 'gpt-5.5',
+          displayName: 'GPT-5.5',
+          description: '',
+          supportedEfforts: ['low', 'high'],
+          defaultEffort: 'low',
+          isDefault: true,
+          hidden: false,
+        },
+        {
+          id: 'hidden',
+          displayName: 'Hidden',
+          description: '',
+          supportedEfforts: ['high'],
+          defaultEffort: 'high',
+          isDefault: false,
+          hidden: true,
+        },
+      ],
+    });
+    const r = await runAdminWriteOp(
+      { kind: 'setModelDefault', project: 'demo', model: 'gpt-5.5', effort: 'high' },
+      { ...deps, backendFor: () => backend },
+    );
+    expect(r.ok).toBe(true);
+    expect(await getProjectByName('demo')).toMatchObject({ defaultModel: 'gpt-5.5', defaultEffort: 'high' });
+
+    const narrowed = await runAdminWriteOp(
+      { kind: 'setModelDefault', project: 'demo', model: 'gpt-5.5', effort: 'medium' },
+      { ...deps, backendFor: () => backend },
+    );
+    expect(narrowed.ok).toBe(true);
+    expect(await getProjectByName('demo')).toMatchObject({ defaultModel: 'gpt-5.5', defaultEffort: 'low' });
+
+    const rejected = await runAdminWriteOp(
+      { kind: 'setModelDefault', project: 'demo', model: 'hidden', effort: 'high' },
+      { ...deps, backendFor: () => backend },
+    );
+    expect(rejected).toEqual({ ok: false, reason: '所选模型无效或已下架，未保存。' });
+  });
+
   it('执行器：成功静默返回，拒绝抛 AdminWriteError（带 code，IPC/HTTP 可还原）', async () => {
     const exec = createAdminWriteExecutor(deps);
     await expect(exec({ kind: 'setAutoCompact', project: 'demo', on: true })).resolves.toBeUndefined();

@@ -32,10 +32,12 @@ describe('admin IPC · 请求/响应关联', () => {
       done: true,
     });
     expect(await caller.call({ kind: 'status' })).toEqual({ connection: 'connected' });
+    expect(await caller.call({ kind: 'listProjectModels', project: 'demo' })).toEqual({ done: true });
     expect(seen).toEqual([
       { kind: 'setNoMention', project: 'demo', on: true },
       { kind: 'setCompletionReminder', mode: 'failures', longTaskMinutes: 3 },
       { kind: 'status' },
+      { kind: 'listProjectModels', project: 'demo' },
     ]);
   });
 

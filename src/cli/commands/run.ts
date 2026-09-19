@@ -178,6 +178,7 @@ async function runSingle(botName?: string): Promise<void> {
         if (op.kind === 'status') {
           return { connection: handle.channel.getConnectionStatus?.()?.state ?? 'unknown' };
         }
+        if (op.kind === 'listProjectModels') return handle.adminListProjectModels(op.project);
         await handle.adminExecute(op);
         return { done: true };
       },
@@ -199,6 +200,14 @@ async function runSingle(botName?: string): Promise<void> {
             );
           }
           await handle.adminExecute(op);
+        },
+        listProjectModels: async (botId, projectName) => {
+          if (botId !== ownAppId) {
+            throw new AdminWriteError(
+              '该机器人不归本进程管：当前是单 bot 运行模式，只能查看本 bot 的项目模型。多 bot 请 `bot use` 勾选后重启，由 supervisor 聚合管理。',
+            );
+          }
+          return handle.adminListProjectModels(projectName);
         },
         liveStatus: async (botId) =>
           botId === ownAppId

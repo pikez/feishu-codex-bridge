@@ -1,5 +1,6 @@
 import { createLarkChannel, Domain, type LarkChannel } from '@larksuiteoapi/node-sdk';
 import type { AdminWriteOp } from '../admin/ops';
+import type { ModelInfo } from '../agent/types';
 import type { AppConfig } from '../config/schema';
 import { log } from '../core/logger';
 import { sep } from 'node:path';
@@ -35,6 +36,8 @@ export interface BridgeHandle {
   /** 管理面写操作（Web 控制台 / supervisor IPC）：进程内执行，与 DM 卡片回调
    * 同一套共享逻辑（admin/ops.ts）；校验拒绝抛 AdminWriteError。 */
   adminExecute: (op: AdminWriteOp) => Promise<void>;
+  /** 实时读取项目后端模型目录，供 Web 默认模型选择器使用。 */
+  adminListProjectModels: (projectName: string) => Promise<ModelInfo[]>;
   /** Graceful teardown: close every codex session (no orphan app-servers) then
    *  drop the long connection. Idempotent enough for a signal handler. */
   shutdown: () => Promise<void>;
@@ -158,5 +161,10 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
     await cliBridge.shutdown().catch((err) => log.fail('cli-bridge', err, { phase: 'shutdown' }));
     await channel.disconnect().catch((err) => log.fail('ws', err, { phase: 'disconnect' }));
   };
-  return { channel, adminExecute: orchestrator.adminExecute, shutdown };
+  return {
+    channel,
+    adminExecute: orchestrator.adminExecute,
+    adminListProjectModels: orchestrator.adminListProjectModels,
+    shutdown,
+  };
 }

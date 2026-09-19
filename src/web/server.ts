@@ -34,7 +34,7 @@ const LOGO_PNG = Buffer.from(LOGO_PNG_BASE64, 'base64');
  *   3. Host/Origin 校验防 DNS rebinding（只认 loopback 及显式监听的 IP）。
  *   4. 端点最小化：只读（state / diagnosis / logs / sessions / setup-status /
  *      daemon / update.check / host-doctor / backends）+「DM 卡片已有等价操作」的
- *      写入（backend / permission / no-mention / auto-compact / completion-reminder / sender-identity）+ Web 专属（GET
+ *      写入（backend / permission / no-mention / auto-compact / model-default / completion-reminder / sender-identity）+ Web 专属（GET
  *      /api/bots/register-qr/stream 扫码注册 SSE + DELETE 取消；
  *      POST /api/backends/:id/install 按需安装 SSE；PATCH/DELETE /api/bots/:id
  *      多 bot 管理；POST /api/daemon/restart 与 /api/update 经 detached helper）。
@@ -525,9 +525,34 @@ export function createWebServer(opts: WebServerOptions): WebServer {
       return;
     }
 
+    // GET /api/project/:name/models —— 🤖 项目后端的实时模型目录（默认模型选择器）。
+    const modelsMatch = /^\/api\/project\/([^/]+)\/models$/.exec(pathName);
+    if (req.method === 'GET' && modelsMatch) {
+      const botId = url.searchParams.get('bot') ?? (await defaultBotId());
+      if (!botId) {
+        sendJson(res, 404, { error: 'no_bot', message: '没有已注册的机器人' });
+        return;
+      }
+      try {
+        const models = await opts.service.listProjectModels(botId, decodeURIComponent(modelsMatch[1]!));
+        sendJson(res, 200, { models });
+      } catch (err) {
+        if (err instanceof NotWiredYetError) {
+          sendJson(res, 501, { error: 'not_wired_yet', message: err.message });
+          return;
+        }
+        if (err instanceof AdminWriteError) {
+          sendJson(res, 409, { error: 'read_rejected', message: err.message });
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
+
     // POST 写操作 —— daemon 进程内为真实写入（共享 admin/ops.ts，与 DM 卡片同
     // 源）；只读预览进程映射 501（NotWiredYetError），校验拒绝映射 409。
-    const writeMatch = /^\/api\/project\/([^/]+)\/(backend|permission|no-mention|auto-compact)$/.exec(pathName);
+    const writeMatch = /^\/api\/project\/([^/]+)\/(backend|permission|no-mention|auto-compact|model-default)$/.exec(pathName);
     if (req.method === 'POST' && writeMatch) {
       const project = decodeURIComponent(writeMatch[1]!);
       const action = writeMatch[2]!;
@@ -554,8 +579,13 @@ export function createWebServer(opts: WebServerOptions): WebServer {
           });
         } else if (action === 'no-mention') {
           await opts.service.setNoMention(botId, project, body.on === true);
-        } else {
+        } else if (action === 'auto-compact') {
           await opts.service.setAutoCompact(botId, project, body.on === true);
+        } else {
+          await opts.service.setModelDefault(botId, project, {
+            model: String(body.model ?? ''),
+            effort: typeof body.effort === 'string' ? (body.effort as never) : undefined,
+          });
         }
         sendJson(res, 200, { ok: true });
       } catch (err) {
