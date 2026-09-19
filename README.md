@@ -112,12 +112,24 @@ feishu-codex-bridge run [--bot <名>]            前台启动（没配置先扫�
 feishu-codex-bridge start                       后台 daemon：装系统服务、开机/登录自启、崩溃自动拉起
 feishu-codex-bridge status|logs|restart|stop    daemon 生命周期（logs -f 跟随日志）
 feishu-codex-bridge update [--check]            更新到最新版（npm i -g）并自动重启 daemon
-feishu-codex-bridge web [--port <端口>]          打开本机网页控制台（默认端口 51847）
+feishu-codex-bridge web [--port <端口>] [--host <IP>]…  打开网页控制台（默认仅本机；可追加内网/Tailscale IP）
 feishu-codex-bridge bot init|list|use|rm        多机器人：扫码注册 / 列表 / 选要连接的 / 移除
 feishu-codex-bridge doctor                      本地自检：后端 / 登录 / 当前机器人
 ```
 
 > ⚠️ 后台服务必须**全局安装**（`npm i -g`），别用 npx —— 服务里硬编码了 CLI 路径，npx 临时缓存会被清理。前台 `run` 用 npx 没问题（单次进程）。
+
+### 从 fork 部署到本机
+
+本仓库与 npm 版本使用相同的包名和 `feishu-codex-bridge` bin 名。要以当前 checkout 覆盖之前从原仓库安装的全局版本，运行：
+
+```bash
+./scripts/deploy.sh
+# 若后台 daemon 正在运行，安装后立即重启它：
+./scripts/deploy.sh --restart
+```
+
+脚本会构建当前代码、安装到当前 `npm prefix --global`，并验证全局 CLI 的版本；先查看目标而不改动可用 `./scripts/deploy.sh --dry-run`。部署 fork 后不要运行 `feishu-codex-bridge update`，它会从 npm 拉取公开版本并覆盖本地部署。
 
 ---
 
@@ -159,7 +171,15 @@ feishu-codex-bridge doctor                      本地自检：后端 / 登录 /
 
 ## 🌐 Web 控制台
 
-`feishu-codex-bridge web` 打开本机浏览器里的管理面板（只绑 `127.0.0.1` + 每次启动随机 token 鉴权），一屏搞定：扫码加机器人、开权限 / 订阅事件 checklist、启停 / 重启 / 更新后台服务、看所有 bot / 项目 / 话题 / 实时日志、后端环境检测。daemon 在跑时是可写控制台；没跑时退化为只读预览，仍可一键启动 daemon。日常管理基本只跟它和飞书私聊控制台打交道。
+`feishu-codex-bridge web` 打开浏览器里的管理面板；默认只绑 `127.0.0.1`，并通过 token 鉴权。一屏搞定：扫码加机器人、开权限 / 订阅事件 checklist、启停 / 重启 / 更新后台服务、看所有 bot / 项目 / 话题 / 实时日志、后端环境检测。daemon 在跑时是可写控制台；没跑时退化为只读预览，仍可一键启动 daemon。日常管理基本只跟它和飞书私聊控制台打交道。
+
+要从内网或 Tailscale 访问，显式列出需要绑定的 IP（可重复，也可逗号分隔）：
+
+```bash
+feishu-codex-bridge web --host 192.168.9.3 --host 100.64.0.21
+```
+
+该命令会保留 `127.0.0.1`，并将地址保存到 `~/.feishu-codex-bridge/web-hosts.json`，供之后启动的 daemon 使用。若 daemon 已在运行，后台服务执行 `feishu-codex-bridge restart`；前台 `run` 则停止后重新运行，使其重新绑定。不要使用 `0.0.0.0` / `::`；内网访问走明文 HTTP，优先通过 Tailscale，并且绝不要转发输出的带 token URL。
 
 ---
 
