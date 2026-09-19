@@ -1,6 +1,6 @@
 import { mkdtempSync, rmSync, writeFileSync, appendFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
-import { tmpdir } from 'node:os';
+import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createWebServer, type WebServer } from '../src/web/server';
@@ -63,6 +63,9 @@ function stubService(): AdminService {
     },
     async setCompletionReminder() {
       throw new NotWiredYetError('🔔 完成提醒');
+    },
+    async setSenderIdentity() {
+      throw new NotWiredYetError('🪪 发信人身份上下文');
     },
     async doctorBackends() {
       return [{ id: 'codex-appserver', name: 'Codex', ok: true, version: '1.0.0', isDefault: true }];
@@ -205,6 +208,9 @@ const TOKEN = 'test-token-1234';
 let web: WebServer;
 let base: string;
 let logDir: string;
+const secondaryLocalIpv4 = Object.values(networkInterfaces())
+  .flat()
+  .find((info) => info?.family === 'IPv4' && !info.internal)?.address;
 
 function get(path: string, init: RequestInit = {}): Promise<Response> {
   return fetch(`${base}${path}`, { redirect: 'manual', ...init });
@@ -306,6 +312,36 @@ describe('web server · 安全（loopback + token + Host 校验）', () => {
   it('跨站 Origin → 403', async () => {
     expect(await rawStatus({ Origin: 'http://evil.example.com' })).toBe(403);
   });
+
+  it.skipIf(!secondaryLocalIpv4)('显式指定多个 IP 时：所有地址共用端口、请求 Host/Origin 均可通过', async () => {
+    // 使用测试机真实的非 loopback IPv4，覆盖内网/Tailscale 网卡的实际 bind 行为；
+    // 没有第二地址的 CI 则跳过这一条（纯地址校验仍由 web-hosts.test.ts 覆盖）。
+    const host = secondaryLocalIpv4!;
+    const multi = createWebServer({
+      service: stubService(),
+      token: TOKEN,
+      logDir,
+      hosts: [host],
+      liveConsole: () => ({ port: 55432, token: 'daemon-token' }),
+    });
+    const { port, urls } = await multi.listen(0);
+    try {
+      expect(urls).toEqual([`http://127.0.0.1:${port}/?token=${TOKEN}`, `http://${host}:${port}/?token=${TOKEN}`]);
+      expect(multi.servers).toHaveLength(2);
+
+      const res = await fetch(`http://${host}:${port}/api/state`, {
+        headers: { Authorization: `Bearer ${TOKEN}`, Origin: `http://${host}:${port}` },
+      });
+      expect(res.status).toBe(200);
+
+      const live = await fetch(`http://${host}:${port}/api/console/live`, {
+        headers: { Authorization: `Bearer ${TOKEN}` },
+      });
+      expect((await live.json()).url).toBe(`http://${host}:55432/?token=daemon-token`);
+    } finally {
+      await multi.close();
+    }
+  });
 });
 
 describe('web server · 只读 API', () => {
@@ -404,6 +440,16 @@ describe('web server · 写操作占位（只读预览：daemon 未跑）', () =
     expect(res.status).toBe(501);
     expect((await jsonOf(res)).error).toBe('not_wired_yet');
   });
+
+  it('POST /api/bots/:id/sender-identity 在只读预览 → 501', async () => {
+    const res = await authed('/api/bots/cli_a/sender-identity', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ on: false }),
+    });
+    expect(res.status).toBe(501);
+    expect((await jsonOf(res)).error).toBe('not_wired_yet');
+  });
 });
 
 describe('web server · 写操作真实现（daemon 进程内 service）', () => {
@@ -423,6 +469,9 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
     };
     svc.setCompletionReminder = async (botId, value) => {
       written.push({ botId, completionReminder: value });
+    };
+    svc.setSenderIdentity = async (botId, on) => {
+      written.push({ botId, senderIdentity: on });
     };
     writeWeb = createWebServer({ service: svc, token: TOKEN, logDir });
     const { port } = await writeWeb.listen(0);
@@ -471,6 +520,27 @@ describe('web server · 写操作真实现（daemon 进程内 service）', () =>
       botId: 'cli_a',
       completionReminder: { mode: 'long', longTaskMinutes: 7 },
     });
+  });
+
+  it('发信人身份开关保存 → 200，并把每 bot 设置交给 service', async () => {
+    const res = await fetch(`${writeBase}/api/bots/cli_a/sender-identity`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ on: false }),
+    });
+    expect(res.status).toBe(200);
+    expect(await jsonOf(res)).toMatchObject({ ok: true, senderIdentityEnabled: false });
+    expect(written).toContainEqual({ botId: 'cli_a', senderIdentity: false });
+  });
+
+  it('发信人身份开关拒绝非布尔值', async () => {
+    const res = await fetch(`${writeBase}/api/bots/cli_a/sender-identity`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ on: 'false' }),
+    });
+    expect(res.status).toBe(400);
+    expect((await jsonOf(res)).message).toContain('on');
   });
 
   it.each([

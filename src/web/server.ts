@@ -15,6 +15,7 @@ import { AdminWriteError } from '../admin/ops';
 import { UI_HTML } from './ui';
 import { GSAP_MIN_JS_BASE64 } from './vendor-gsap';
 import { LOGO_PNG_BASE64 } from './vendor-logo';
+import { LOOPBACK_WEB_HOST, normalizeWebHosts, webUrl } from './hosts';
 
 /** vendored GSAP 解码一次（模块级，不每请求解码）；/vendor/gsap.min.js 路由直接吐这个 Buffer。 */
 const GSAP_MIN_JS = Buffer.from(GSAP_MIN_JS_BASE64, 'base64');
@@ -22,17 +23,18 @@ const GSAP_MIN_JS = Buffer.from(GSAP_MIN_JS_BASE64, 'base64');
 const LOGO_PNG = Buffer.from(LOGO_PNG_BASE64, 'base64');
 
 /**
- * 本机 Web 控制台 HTTP 面（node:http，零新依赖）。
+ * Web 控制台 HTTP 面（node:http，零新依赖）。
  *
  * 安全清单（设计文档 §5，逐条落实）：
- *   1. 仅绑定 127.0.0.1，绝不 0.0.0.0；不提供任何「远程访问」配置项。
+ *   1. 默认仅绑定 127.0.0.1。用户显式配置的字面内网 / Tailscale IP 才会额外
+ *      监听；绝不接受 0.0.0.0 / :: 通配地址。
  *   2. token 鉴权：启动生成随机 token（crypto.randomUUID）；所有请求校验
  *      `Authorization: Bearer` / cookie；`?token=` 仅用于首跳换 cookie（随后
  *      302 去掉 URL 里的 token，防日志/历史记录泄漏长期凭据）。
- *   3. Host/Origin 校验防 DNS rebinding（只认 127.0.0.1 / localhost / [::1]）。
+ *   3. Host/Origin 校验防 DNS rebinding（只认 loopback 及显式监听的 IP）。
  *   4. 端点最小化：只读（state / diagnosis / logs / sessions / setup-status /
  *      daemon / update.check / host-doctor / backends）+「DM 卡片已有等价操作」的
- *      写入（backend / permission / no-mention / auto-compact / completion-reminder）+ Web 专属（GET
+ *      写入（backend / permission / no-mention / auto-compact / completion-reminder / sender-identity）+ Web 专属（GET
  *      /api/bots/register-qr/stream 扫码注册 SSE + DELETE 取消；
  *      POST /api/backends/:id/install 按需安装 SSE；PATCH/DELETE /api/bots/:id
  *      多 bot 管理；POST /api/daemon/restart 与 /api/update 经 detached helper）。
@@ -53,6 +55,8 @@ const LOGO_PNG = Buffer.from(LOGO_PNG_BASE64, 'base64');
 export const DEFAULT_WEB_PORT = 51847;
 export interface WebServerOptions {
   service: AdminService;
+  /** 监听的字面 IP；省略时仅 127.0.0.1。0.0.0.0 / :: 会被拒绝。 */
+  hosts?: readonly string[];
   /**
    * 只读预览专用：探测「daemon 的可写控制台是否已在别处跑」。注入即代表本进程是只读
    * 预览（web 命令）——拿到活记录就让前端把用户带去那条可写控制台（见 /api/console/live）。
@@ -70,8 +74,10 @@ export interface WebServerOptions {
 export interface WebServer {
   server: Server;
   token: string;
-  /** 监听 127.0.0.1:port（port=0 取临时端口）；返回实际端口与含 token 的可点击 URL。 */
-  listen(port: number): Promise<{ port: number; url: string }>;
+  /** 主 server + 每个额外监听 IP 的 server；用于生命周期与测试可见性。 */
+  servers: readonly Server[];
+  /** 在每个已配置 IP 上监听。port=0 时先分配一个端口，再让全部 IP 使用它。 */
+  listen(port: number): Promise<{ port: number; url: string; urls: string[] }>;
   close(): Promise<void>;
 }
 
@@ -82,6 +88,7 @@ const COMPLETION_REMINDER_MODES: readonly CompletionReminderMode[] = ['manual', 
 
 export function createWebServer(opts: WebServerOptions): WebServer {
   const token = opts.token ?? randomUUID();
+  const hosts = normalizeWebHosts(opts.hosts ?? []);
   const html = opts.html ?? UI_HTML;
   const logDir = opts.logDir ?? join(paths.appDir, 'logs');
   const sseCleanups = new Set<() => void>();
@@ -108,7 +115,7 @@ export function createWebServer(opts: WebServerOptions): WebServer {
    */
   let qrSession: { id: string; abort: AbortController } | null = null;
 
-  const server = createServer((req, res) => {
+  const handleRequest = (req: IncomingMessage, res: ServerResponse): void => {
     void handle(req, res).catch((err) => {
       if (!res.headersSent) {
         sendJson(res, 500, { error: 'internal', message: err instanceof Error ? err.message : String(err) });
@@ -116,16 +123,18 @@ export function createWebServer(opts: WebServerOptions): WebServer {
         res.end();
       }
     });
-  });
+  };
+  const server = createServer(handleRequest);
+  const servers: Server[] = [server];
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     // ── Host/Origin 校验（防 DNS rebinding）────────────────────────────────
-    if (!isLoopbackHost(req.headers.host)) {
-      sendJson(res, 403, { error: 'forbidden_host', message: '仅允许 127.0.0.1 / localhost 访问' });
+    if (!isAllowedHost(req.headers.host, hosts)) {
+      sendJson(res, 403, { error: 'forbidden_host', message: '请求 Host 不在控制台的监听地址列表中' });
       return;
     }
     const origin = req.headers.origin;
-    if (origin !== undefined && !isLoopbackOrigin(origin)) {
+    if (origin !== undefined && !isAllowedOrigin(origin, hosts)) {
       sendJson(res, 403, { error: 'forbidden_origin', message: '跨站请求被拒绝' });
       return;
     }
@@ -259,7 +268,13 @@ export function createWebServer(opts: WebServerOptions): WebServer {
     // 前端据此把用户从只读预览带去可写控制台。daemon 自身没注入 liveConsole → 永远 live:false。
     if (req.method === 'GET' && pathName === '/api/console/live') {
       const live = opts.liveConsole?.();
-      if (live) sendJson(res, 200, { live: true, url: `http://127.0.0.1:${live.port}/?token=${live.token}` });
+      if (live) {
+        // 预览页可能经内网/Tailscale 地址打开。切换到 daemon 时继续使用该地址，
+        // 否则远程浏览器跳到自己的 127.0.0.1，会看起来像 daemon 消失了。
+        const requestedHost = addressFromHostHeader(req.headers.host) ?? hosts[0] ?? LOOPBACK_WEB_HOST;
+        const urls = hosts.map((host) => webUrl(host, live.port, live.token));
+        sendJson(res, 200, { live: true, url: webUrl(requestedHost, live.port, live.token), urls });
+      }
       else sendJson(res, 200, { live: false });
       return;
     }
@@ -362,6 +377,36 @@ export function createWebServer(opts: WebServerOptions): WebServer {
           longTaskMinutes: minutes,
         });
         sendJson(res, 200, { ok: true, completionReminder: { mode, longTaskMinutes: minutes } });
+      } catch (err) {
+        if (err instanceof NotWiredYetError) {
+          sendJson(res, 501, { error: 'not_wired_yet', message: err.message });
+        } else if (err instanceof AdminWriteError) {
+          sendJson(res, 409, { error: 'write_rejected', message: err.message });
+        } else {
+          throw err;
+        }
+      }
+      return;
+    }
+
+    // POST /api/bots/:appId/sender-identity —— 每 bot 的发信人身份上下文开关。
+    // Web 只投递结构化 op；真正的 config.json 落盘与 LIVE cfg 热更新在 bot 进程内完成。
+    const senderIdentityMatch = /^\/api\/bots\/([^/]+)\/sender-identity$/.exec(pathName);
+    if (req.method === 'POST' && senderIdentityMatch) {
+      let body: Record<string, unknown>;
+      try {
+        body = await readJsonBody(req);
+      } catch {
+        sendJson(res, 400, { error: 'bad_body', message: '请求体必须是 JSON' });
+        return;
+      }
+      if (typeof body.on !== 'boolean') {
+        sendJson(res, 400, { error: 'invalid_input', message: 'on 必须是布尔值' });
+        return;
+      }
+      try {
+        await opts.service.setSenderIdentity(decodeURIComponent(senderIdentityMatch[1]!), body.on);
+        sendJson(res, 200, { ok: true, senderIdentityEnabled: body.on });
       } catch (err) {
         if (err instanceof NotWiredYetError) {
           sendJson(res, 501, { error: 'not_wired_yet', message: err.message });
@@ -840,23 +885,31 @@ export function createWebServer(opts: WebServerOptions): WebServer {
 
   return {
     server,
+    servers,
     token,
-    listen(port: number): Promise<{ port: number; url: string }> {
-      return new Promise((resolve, reject) => {
-        server.once('error', reject);
-        // 安全清单 #1：仅 loopback，绝不 0.0.0.0。
-        server.listen(port, '127.0.0.1', () => {
-          const addr = server.address();
-          const actual = typeof addr === 'object' && addr ? addr.port : port;
-          resolve({ port: actual, url: `http://127.0.0.1:${actual}/?token=${token}` });
-        });
-      });
+    async listen(port: number): Promise<{ port: number; url: string; urls: string[] }> {
+      try {
+        // 先绑定 loopback。port=0 时由它分配实际端口，后续 IP 才能保证共用同一端口。
+        await listenOn(server, port, hosts[0] ?? LOOPBACK_WEB_HOST);
+        const addr = server.address();
+        const actual = typeof addr === 'object' && addr ? addr.port : port;
+
+        for (const host of hosts.slice(1)) {
+          const extra = createServer(handleRequest);
+          servers.push(extra);
+          await listenOn(extra, actual, host);
+        }
+
+        const urls = hosts.map((host) => webUrl(host, actual, token));
+        return { port: actual, url: urls[0]!, urls };
+      } catch (err) {
+        await closeServers(servers);
+        throw err;
+      }
     },
     close(): Promise<void> {
       for (const cleanup of [...sseCleanups]) cleanup();
-      return new Promise((resolve, reject) => {
-        server.close((err) => (err ? reject(err) : resolve()));
-      });
+      return closeServers(servers);
     },
   };
 }
@@ -892,18 +945,63 @@ function safeEqual(a: string, b: string): boolean {
   return ba.length === bb.length && timingSafeEqual(ba, bb);
 }
 
-function isLoopbackHost(host: string | undefined): boolean {
-  if (!host) return false;
-  return /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(host);
+/** Host / Origin 只接受实际绑定的字面 IP（加上兼容的 loopback 名称），防 DNS rebinding。 */
+function isAllowedHost(host: string | undefined, allowedHosts: readonly string[]): boolean {
+  const address = addressFromHostHeader(host);
+  return address !== undefined && isAllowedAddress(address, allowedHosts);
 }
 
-function isLoopbackOrigin(origin: string): boolean {
+function isAllowedOrigin(origin: string, allowedHosts: readonly string[]): boolean {
   try {
-    const u = new URL(origin);
-    return u.protocol === 'http:' && /^(127\.0\.0\.1|localhost|\[::1\])$/i.test(u.hostname);
+    const url = new URL(origin);
+    return url.protocol === 'http:' && isAllowedAddress(url.hostname, allowedHosts);
   } catch {
     return false;
   }
+}
+
+function isAllowedAddress(hostname: string, allowedHosts: readonly string[]): boolean {
+  // WHATWG URL 在不同 Node 版本对 IPv6 hostname 是否保留方括号的行为不同；统一剥掉。
+  const actual = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (actual === 'localhost' || actual === '127.0.0.1' || actual === '::1') return true;
+  return allowedHosts.some((host) => host.toLowerCase() === actual);
+}
+
+function addressFromHostHeader(host: string | undefined): string | undefined {
+  if (!host || host.includes('/') || host.includes('\\')) return undefined;
+  try {
+    const url = new URL(`http://${host}`);
+    return url.hostname.replace(/^\[|\]$/g, '');
+  } catch {
+    return undefined;
+  }
+}
+
+function listenOn(server: Server, port: number, host: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (err: Error): void => {
+      server.removeListener('listening', onListening);
+      reject(err);
+    };
+    const onListening = (): void => {
+      server.removeListener('error', onError);
+      resolve();
+    };
+    server.once('error', onError);
+    server.once('listening', onListening);
+    server.listen(port, host);
+  });
+}
+
+function closeServers(servers: readonly Server[]): Promise<void> {
+  return Promise.all(
+    servers.filter((server) => server.listening).map(
+      (server) =>
+        new Promise<void>((resolve, reject) => {
+          server.close((err) => (err ? reject(err) : resolve()));
+        }),
+    ),
+  ).then(() => undefined);
 }
 
 function todayLogFile(dir: string): string {

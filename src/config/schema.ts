@@ -98,6 +98,10 @@ export interface AppPreferences {
   messageReply?: MessageReplyMode;
   /** render tool-call blocks in output. Default true. */
   showToolCalls?: boolean;
+  /** Whether the bridge includes the Feishu sender's name and open_id in Agent
+   * input. Default true; disable when Codex session history must not retain
+   * per-message sender identity. */
+  includeSenderIdentity?: boolean;
   /** 「模型 · 推理强度」脚注的显示档位（运行卡右下角）。off/running/always，
    * 默认 running（仅输出时显示，生成完即收起）——平时能扫一眼当前模型，又不在终态
    * 卡上长期留标签。兼容历史布尔值：true→always、false→off（见 {@link getModelDisplay}）。 */
@@ -206,6 +210,12 @@ export function getMessageReplyMode(cfg: AppConfig): MessageReplyMode {
 
 export function getShowToolCalls(cfg: AppConfig): boolean {
   return cfg.preferences?.showToolCalls !== false;
+}
+
+/** Whether Agent input includes the Feishu sender's display name and open_id.
+ * Default true preserves established group-session behavior for existing bots. */
+export function getIncludeSenderIdentity(cfg: AppConfig): boolean {
+  return cfg.preferences?.includeSenderIdentity !== false;
 }
 
 /**

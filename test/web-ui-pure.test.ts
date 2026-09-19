@@ -40,6 +40,12 @@ describe('ui.ts UI_PURE_JS 内联进 UI_HTML（同一份字符串，零漂移）
     expect(UI_HTML).toContain('运行卡不显示提醒按钮');
   });
 
+  it('每 bot 提供发信人身份上下文开关', () => {
+    expect(UI_HTML).toContain('向 Agent 传递发信人身份');
+    expect(UI_HTML).toContain('/sender-identity');
+    expect(UI_HTML).toContain('open_id');
+  });
+
   it('添加机器人只保留扫码，不暴露手填表单或 POST /api/bots', () => {
     expect(UI_HTML).not.toContain('已有飞书应用？手动填 App ID/Secret');
     expect(UI_HTML).not.toContain("fetch('/api/bots', {");

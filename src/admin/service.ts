@@ -4,6 +4,7 @@ import { botPaths, botDir } from '../config/paths';
 import { removeSecret } from '../config/keystore';
 import {
   getCompletionReminderConfig,
+  getIncludeSenderIdentity,
   isComplete,
   secretKeyForApp,
   type AppConfig,
@@ -115,6 +116,8 @@ export interface AdminService {
     botId: string,
     value: { mode: CompletionReminderMode; longTaskMinutes: number },
   ): Promise<void>;
+  /** 🪪 每 bot 的发信人身份上下文开关（写）；影响下一条 Agent 输入。 */
+  setSenderIdentity(botId: string, on: boolean): Promise<void>;
   /** 🩺 对全部注册后端做环境体检（doctor 探测，绝不抛错）。 */
   doctorBackends(): Promise<AdminBackendStatus[]>;
   /** 事件订阅三态诊断（ok / missing / unpublished / unchecked，绝不抛错）。 */
@@ -264,6 +267,8 @@ export interface AdminBot {
   connection?: string;
   /** 每 bot 的普通任务结束提醒 effective 配置（缺省 = failures / 3 分钟）。 */
   completionReminder: ResolvedCompletionReminderConfig;
+  /** 是否向 Agent 输入编织飞书发信人的展示名和 open_id（缺省 = true）。 */
+  senderIdentityEnabled?: boolean;
 }
 
 /** daemon 进程内的实时运行状态（注入 {@link AdminServiceDeps.liveStatus}）。 */
@@ -519,6 +524,15 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
     }
   }
 
+  /** config 损坏/缺失时也维持兼容默认：继续传递发信人身份。 */
+  async function senderIdentityEnabledFor(botId: string): Promise<boolean> {
+    try {
+      return getIncludeSenderIdentity((await loadConfig(botPaths(botId).configFile)) as AppConfig);
+    } catch {
+      return true;
+    }
+  }
+
   function executeWrite(botId: string, action: string, op: AdminWriteOp): Promise<void> {
     if (!deps.executeWrite) throw new NotWiredYetError(action);
     return deps.executeWrite(botId, op);
@@ -530,7 +544,11 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       const configured = reg.bots.some((b) => b.active !== undefined);
       const out: AdminBot[] = [];
       for (const b of reg.bots) {
-        const [run, completionReminder] = await Promise.all([runState(b.appId), completionReminderFor(b.appId)]);
+        const [run, completionReminder, senderIdentityEnabled] = await Promise.all([
+          runState(b.appId),
+          completionReminderFor(b.appId),
+          senderIdentityEnabledFor(b.appId),
+        ]);
         out.push({
           name: b.name,
           appId: b.appId,
@@ -544,6 +562,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
           startedAt: run.startedAt,
           connection: run.connection,
           completionReminder,
+          senderIdentityEnabled,
         });
       }
       return out;
@@ -592,6 +611,10 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
         mode: value.mode,
         longTaskMinutes: value.longTaskMinutes,
       });
+    },
+
+    async setSenderIdentity(botId: string, on: boolean): Promise<void> {
+      await executeWrite(botId, '🪪 发信人身份上下文', { kind: 'setSenderIdentity', on });
     },
 
     doctorBackends(): Promise<AdminBackendStatus[]> {

@@ -1,6 +1,7 @@
 import type { AdminService } from '../admin/service';
 import { log } from '../core/logger';
 import { clearWebConsole, publishWebConsole, stableWebConsoleToken } from './discovery';
+import { readWebHosts } from './hosts';
 import { createWebServer, DEFAULT_WEB_PORT } from './server';
 
 /**
@@ -20,6 +21,7 @@ import { createWebServer, DEFAULT_WEB_PORT } from './server';
  */
 export interface MountedWebConsole {
   url: string;
+  urls: string[];
   port: number;
   close: () => Promise<void>;
 }
@@ -29,7 +31,7 @@ async function listenCanonical(
   web: ReturnType<typeof createWebServer>,
   attempts = 25,
   gapMs = 200,
-): Promise<{ port: number; url: string }> {
+): Promise<{ port: number; url: string; urls: string[] }> {
   for (let i = 0; i < attempts; i++) {
     try {
       return await web.listen(DEFAULT_WEB_PORT);
@@ -43,11 +45,12 @@ async function listenCanonical(
 }
 
 export async function mountWebConsole(service: AdminService): Promise<MountedWebConsole | undefined> {
-  const web = createWebServer({ service, token: stableWebConsoleToken() });
+  const web = createWebServer({ service, token: stableWebConsoleToken(), hosts: await readWebHosts() });
   let port: number;
   let url: string;
+  let urls: string[];
   try {
-    ({ port, url } = await listenCanonical(web));
+    ({ port, url, urls } = await listenCanonical(web));
   } catch (err) {
     log.fail('web', err, { phase: 'console-listen' });
     return undefined;
@@ -60,6 +63,7 @@ export async function mountWebConsole(service: AdminService): Promise<MountedWeb
 
   return {
     url,
+    urls,
     port,
     close: async (): Promise<void> => {
       process.removeListener('exit', exitCleanup);

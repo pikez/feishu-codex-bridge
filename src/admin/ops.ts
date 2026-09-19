@@ -6,6 +6,7 @@ import {
   COMPLETION_REMINDER_LONG_TASK_MAX_MINUTES,
   COMPLETION_REMINDER_LONG_TASK_MIN_MINUTES,
   getCompletionReminderConfig,
+  getIncludeSenderIdentity,
   type AppConfig,
   type AppPreferences,
   type CompletionReminderMode,
@@ -51,7 +52,8 @@ export type AdminWriteOp =
       kind: 'setCompletionReminder';
       mode: CompletionReminderMode;
       longTaskMinutes: number;
-    };
+    }
+  | { kind: 'setSenderIdentity'; on: boolean };
 
 /** 写操作被校验拒绝（中文原因可直接上卡/上 HTTP body）。HTTP 层映射 409；
  * IPC 层凭 code 还原类型。 */
@@ -70,6 +72,7 @@ export type AdminWriteOutcome = { ok: true; project: Project } | { ok: false; re
 /** bot 全局偏好写入的返回；与项目写共用 `{ok:false,reason}` 拒绝协议。 */
 export type AdminPreferencesWriteOutcome =
   | { ok: true; completionReminder: ResolvedCompletionReminderConfig }
+  | { ok: true; senderIdentityEnabled: boolean }
   | { ok: false; reason: string };
 
 /**
@@ -346,10 +349,35 @@ export async function performSetCompletionReminder(opts: {
   return { ok: true, completionReminder: getCompletionReminderConfig(opts.cfg) };
 }
 
+/**
+ * Set whether the bridge writes the Feishu sender's display name and open_id
+ * into new Agent inputs. This is a bot-wide privacy preference: it does not
+ * change Feishu authorization or routing, and takes effect on the next message.
+ */
+export async function performSetSenderIdentity(opts: {
+  cfg: AppConfig;
+  on: boolean;
+  /** 测试注入；生产缺省走 config/store 的原子 saveConfig。 */
+  persistConfig?: (cfg: AppConfig) => Promise<void>;
+  /** 与其它 DM/Web preferences 写共享的串行 writer。 */
+  writePreferences?: AppPreferencesWriter;
+}): Promise<AdminPreferencesWriteOutcome> {
+  // IPC messages are runtime data, so preserve the Web route's boolean guard at
+  // the shared write seam too.
+  if (typeof opts.on !== 'boolean') return { ok: false, reason: '发信人身份开关必须是布尔值' };
+
+  const writePreferences =
+    opts.writePreferences ?? createAppPreferencesWriter({ cfg: opts.cfg, persistConfig: opts.persistConfig });
+  await writePreferences((preferences) => {
+    preferences.includeSenderIdentity = opts.on;
+  });
+  return { ok: true, senderIdentityEnabled: getIncludeSenderIdentity(opts.cfg) };
+}
+
 export interface AdminWriteExecutorDeps {
   backendFor: (id?: string) => AgentBackend;
   evictLiveSessionsForChat: (chatId: string) => Promise<void>;
-  /** LIVE bot config；setCompletionReminder 需要它来热更新运行态。 */
+  /** LIVE bot config；bot 级偏好写需要它来热更新运行态。 */
   cfg?: AppConfig;
   /** 测试注入；生产缺省由 performSetCompletionReminder 调 saveConfig。 */
   persistConfig?: (cfg: AppConfig) => Promise<void>;
@@ -400,6 +428,14 @@ export async function runAdminWriteOp(
         cfg: deps.cfg,
         mode: op.mode,
         longTaskMinutes: op.longTaskMinutes,
+        persistConfig: deps.persistConfig,
+        writePreferences: deps.writePreferences,
+      });
+    case 'setSenderIdentity':
+      if (!deps.cfg) return { ok: false, reason: 'bot 运行配置不可用，无法即时更新发信人身份上下文' };
+      return performSetSenderIdentity({
+        cfg: deps.cfg,
+        on: op.on,
         persistConfig: deps.persistConfig,
         writePreferences: deps.writePreferences,
       });

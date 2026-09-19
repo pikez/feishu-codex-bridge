@@ -129,4 +129,6 @@ export const paths = {
   /** 稳定的 Web 控制台 token（0600，**不随进程退出清理**）——让重启 / 预览→daemon
    * 切换后浏览器里那条带 token 的 URL 始终有效，不再 401。删此文件即轮换 token。 */
   webTokenFile: join(appDir, 'web-token'),
+  /** Web 控制台的显式监听 IP 列表（0600）。未配置时只监听 127.0.0.1。 */
+  webHostsFile: join(appDir, 'web-hosts.json'),
 };

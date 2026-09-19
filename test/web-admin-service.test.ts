@@ -87,10 +87,10 @@ beforeAll(async () => {
     backend: 'codex-appserver',
     allowedUsers: ['ou_1'],
   });
-  // 每 bot 的完成提醒来自各自 config.json；A 自定义，B 缺省走 failures / 3。
+  // 每 bot 的全局偏好来自各自 config.json；A 关闭发信人身份，B 保持默认开启。
   writeFileSync(
     botPaths(BOT_A).configFile,
-    JSON.stringify({ preferences: { completionReminder: { mode: 'long', longTaskMinutes: 7 } } }),
+    JSON.stringify({ preferences: { completionReminder: { mode: 'long', longTaskMinutes: 7 }, includeSenderIdentity: false } }),
     'utf8',
   );
   for (const [threadId, chatId] of [
@@ -141,7 +141,9 @@ describe('createReadonlyAdminService · 只读方法（显式路径，不碰全�
     expect(a.active).toBe(true);
     expect(a.botName).toBe('阿尔法');
     expect(a.completionReminder).toEqual({ mode: 'long', longTaskMinutes: 7 });
+    expect(a.senderIdentityEnabled).toBe(false);
     expect(b.completionReminder).toEqual({ mode: 'failures', longTaskMinutes: 3 });
+    expect(b.senderIdentityEnabled).toBe(true);
     expect(b.current).toBe(false);
     expect(b.active).toBe(false);
     // 没有单实例锁文件 → 未在跑；真实 WS 状态只有 daemon 进程内才有
@@ -206,7 +208,7 @@ describe('createReadonlyAdminService · 只读方法（显式路径，不碰全�
 });
 
 describe('createReadonlyAdminService · 写方法（只读预览占位）', () => {
-  it('五个写方法一律抛 NotWiredYetError', async () => {
+  it('六个写方法一律抛 NotWiredYetError', async () => {
     await expect(service.switchBackend(BOT_A, 'proj-a', 'codex-appserver')).rejects.toBeInstanceOf(NotWiredYetError);
     await expect(service.setPermissionMode(BOT_A, 'proj-a', { mode: 'qa' })).rejects.toBeInstanceOf(NotWiredYetError);
     await expect(service.setNoMention(BOT_A, 'proj-a', true)).rejects.toBeInstanceOf(NotWiredYetError);
@@ -214,6 +216,7 @@ describe('createReadonlyAdminService · 写方法（只读预览占位）', () =
     await expect(
       service.setCompletionReminder(BOT_A, { mode: 'failures', longTaskMinutes: 3 }),
     ).rejects.toBeInstanceOf(NotWiredYetError);
+    await expect(service.setSenderIdentity(BOT_A, false)).rejects.toBeInstanceOf(NotWiredYetError);
   });
 
   it('NotWiredYetError 带 code 和「先起 daemon」的引导文案', async () => {
@@ -236,6 +239,7 @@ describe('createAdminService · daemon 进程内（executeWrite + liveStatus 注
     await daemon.setNoMention(BOT_A, 'proj-a', false);
     await daemon.setAutoCompact(BOT_A, 'proj-a', true);
     await daemon.setCompletionReminder(BOT_A, { mode: 'long', longTaskMinutes: 8 });
+    await daemon.setSenderIdentity(BOT_A, false);
     expect(calls).toEqual([
       { botId: BOT_A, op: { kind: 'switchBackend', project: 'proj-a', backend: 'codex-appserver' } },
       {
@@ -245,6 +249,7 @@ describe('createAdminService · daemon 进程内（executeWrite + liveStatus 注
       { botId: BOT_A, op: { kind: 'setNoMention', project: 'proj-a', on: false } },
       { botId: BOT_A, op: { kind: 'setAutoCompact', project: 'proj-a', on: true } },
       { botId: BOT_A, op: { kind: 'setCompletionReminder', mode: 'long', longTaskMinutes: 8 } },
+      { botId: BOT_A, op: { kind: 'setSenderIdentity', on: false } },
     ]);
   });
 

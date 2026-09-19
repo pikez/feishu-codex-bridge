@@ -96,8 +96,8 @@ async function runOnboardingConsole(): Promise<void> {
   }
   console.log('\n还没有配置任何飞书机器人 —— 已进入「引导控制台」，到浏览器里扫码创建第一个：');
   if (process.stdout.isTTY) {
-    console.log(`\n🌐 ${webConsole.url}`);
-    console.log('   仅本机可访问（127.0.0.1）；URL 含 token 勿外传。\n');
+    console.log(`\n🌐 ${webConsole.urls.join('\n   ')}`);
+    console.log('   URL 含 token 勿外传。\n');
   } else {
     console.log(
       `\n🌐 Web 控制台已启动（127.0.0.1:${webConsole.port}）。运行 ` +
@@ -224,8 +224,8 @@ async function runSingle(botName?: string): Promise<void> {
         // 含 token 的 URL 只在前台 TTY 打印；后台 daemon 的 stdout 会被 launchd/
         // systemd 重定向落盘——token 绝不进日志，后台改用 `web` 命令经 0600 发现
         // 文件跳转。
-        console.log(`🌐 Web 控制台：${webConsole.url}`);
-        console.log('   仅本机可访问（127.0.0.1）；URL 含 token 勿外传。也可随时 `feishu-codex-bridge web` 重新打开。\n');
+        console.log(`🌐 Web 控制台：\n   ${webConsole.urls.join('\n   ')}`);
+        console.log('   URL 含 token 勿外传。也可随时 `feishu-codex-bridge web` 重新打开。\n');
       } else {
         console.log(`🌐 Web 控制台已内嵌启动（127.0.0.1:${webConsole.port}）：运行 \`feishu-codex-bridge web\` 获取登录链接。`);
       }

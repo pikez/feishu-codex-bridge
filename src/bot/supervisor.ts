@@ -184,7 +184,7 @@ export async function runSupervisor(bots: BotEntry[]): Promise<void> {
     if (process.stdout.isTTY) {
       // 含 token 的 URL 只在前台 TTY 打印（后台 stdout 会落盘成日志，token 不进
       // 日志——后台用 `web` 命令经 0600 发现文件跳转）。
-      console.log(`🌐 Web 控制台（聚合 ${bots.length} 个机器人）：${webConsole.url}\n`);
+      console.log(`🌐 Web 控制台（聚合 ${bots.length} 个机器人）：\n   ${webConsole.urls.join('\n   ')}\n`);
     } else {
       console.log(`🌐 Web 控制台已内嵌启动（127.0.0.1:${webConsole.port}）：运行 \`feishu-codex-bridge web\` 获取登录链接。`);
     }

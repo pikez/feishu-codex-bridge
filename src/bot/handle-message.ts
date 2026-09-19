@@ -34,6 +34,7 @@ import {
 import { isGoalTerminal, UsageError } from '../agent/types';
 import {
   getMaxConcurrentRuns,
+  getIncludeSenderIdentity,
   getPendingPolicy,
   getModelDisplay,
   getRunIdleTimeoutMs,
@@ -1216,8 +1217,10 @@ export function createOrchestrator(
     }
     // Identity weave (outermost within ingestContext): fold WHO sent this turn so
     // codex can match the roster (approve-gate) and @ them back. Covers both the
-    // first-turn (startReservedRun) and mid-turn (handleTurn) paths.
-    body = weaveSender(body, msg);
+    // first-turn (startReservedRun) and mid-turn (handleTurn) paths. This is a
+    // bot-level privacy preference; it is read from LIVE cfg so Web saves affect
+    // the next inbound message without restarting the bot.
+    if (getIncludeSenderIdentity(cfg)) body = weaveSender(body, msg);
     return body;
   }
 

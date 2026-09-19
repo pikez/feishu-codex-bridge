@@ -2087,6 +2087,7 @@ ${UI_PURE_JS}
 
     // 🔔 普通任务结束提醒（每 bot 独立）。选择即保存；仅 long 额外展示分钟阈值。
     renderCompletionReminderCard(right, b);
+    renderSenderIdentityCard(right, b);
 
     cols.appendChild(left);
     cols.appendChild(right);
@@ -2208,6 +2209,28 @@ ${UI_PURE_JS}
       threshold.appendChild(save);
       card.appendChild(threshold);
     }
+    root.appendChild(card);
+  }
+
+  function renderSenderIdentityCard(root, b) {
+    var enabled = b.senderIdentityEnabled !== false;
+    var card = el('div', 'card');
+    card.appendChild(el('h2', null, '🪪 向 Agent 传递发信人身份'));
+    card.appendChild(el('div', 'note', '将飞书发信人的展示名和 open_id 附在每条入站消息中。每个机器人独立设置，保存后从下一条消息生效。'));
+    card.appendChild(optButtons(
+      [{ label: '开', value: 'on' }, { label: '关', value: 'off' }],
+      enabled ? 'on' : 'off',
+      function (value) {
+        postWrite('/api/bots/' + encodeURIComponent(b.appId) + '/sender-identity', { on: value === 'on' });
+      },
+    ));
+    card.appendChild(el(
+      'div',
+      'note',
+      enabled
+        ? '开启后，Agent 能在共享会话中区分提问者，并可精确 @ 当前用户。'
+        : '关闭后，Codex 和其他 Agent 的后续消息不再包含姓名或 open_id；不影响飞书权限和消息回复。',
+    ));
     root.appendChild(card);
   }
 

@@ -11,6 +11,7 @@ import {
   performSetCompletionReminder,
   performSetNoMention,
   performSetPermissionMode,
+  performSetSenderIdentity,
   probeBackends as opsProbeBackends,
   runAdminWriteOp,
   validateBackendSwitch as opsValidateBackendSwitch,
@@ -256,6 +257,29 @@ describe('performSetCompletionReminder', () => {
     await Promise.all([thresholdWrite, modeOnlyWrite]);
     expect(snapshots[1]?.preferences?.completionReminder).toEqual({ mode: 'always', longTaskMinutes: 12 });
     expect(cfg.preferences?.completionReminder).toEqual({ mode: 'always', longTaskMinutes: 12 });
+  });
+});
+
+describe('performSetSenderIdentity', () => {
+  function config(): AppConfig {
+    return {
+      accounts: { app: { id: 'cli_test', secret: 'secret', tenant: 'feishu' } },
+      preferences: { showToolCalls: true },
+    };
+  }
+
+  it('先落盘再关闭运行态的发信人身份上下文，并保留其他偏好', async () => {
+    const cfg = config();
+    const persist = vi.fn(async (next: AppConfig) => {
+      expect(cfg.preferences?.includeSenderIdentity).toBeUndefined();
+      expect(next.preferences).toEqual({ showToolCalls: true, includeSenderIdentity: false });
+    });
+
+    const r = await performSetSenderIdentity({ cfg, on: false, persistConfig: persist });
+
+    expect(r).toEqual({ ok: true, senderIdentityEnabled: false });
+    expect(cfg.preferences).toEqual({ showToolCalls: true, includeSenderIdentity: false });
+    expect(persist).toHaveBeenCalledOnce();
   });
 });
 

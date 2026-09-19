@@ -6,10 +6,10 @@ import { paths } from '../config/paths';
 /**
  * daemon 内嵌 Web 控制台的发现文件（~/.feishu-codex-bridge/web-console.json）。
  *
- * 安全模型（与第一棒一致，不放松）：
- *   - token 只授予「本机本用户」已有的能力（控制台仍仅绑 127.0.0.1 + token），
- *     文件 0600 仅属主可读——与 secrets.enc / config.json 同一信任域；拿得到
- *     这个文件的人本来就拿得到密钥库。
+ * 安全模型：
+ *   - token 是控制台凭据；默认控制台仅绑 127.0.0.1，额外内网 / Tailscale 监听
+ *     只能由用户显式配置。发现文件仍是 0600，仅属主可读——与 secrets.enc /
+ *     config.json 同一信任域；拿得到这个文件的人本来就拿得到密钥库。
  *   - daemon 退出清理（shutdown 路径 + process exit 钩子）；读取方校验 pid
  *     活性，崩溃残留（pid 已死）一律视为不存在，绝不把陈旧 token 当真。
  *   - pid 归属校验：clear 只删自己写的记录——两个 daemon 先后启动时，后者

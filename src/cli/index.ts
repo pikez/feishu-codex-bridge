@@ -10,6 +10,10 @@ import { runDaemonControl } from './commands/daemon-control';
 import { runWinRelaunch } from '../service/win-startup';
 import { secretsGet, secretsSet, secretsList, secretsRemove } from './commands/secrets';
 
+function collectWebHost(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
 const program = new Command();
 
 program
@@ -72,10 +76,11 @@ program
 
 program
   .command('web')
-  .description('本机 Web 控制台（只读预览，仅 127.0.0.1 + token；写操作随 daemon 集成开放）')
+  .description('Web 控制台（默认仅 127.0.0.1；可显式追加内网/Tailscale IP，写操作随 daemon 集成开放）')
   .option('--port <port>', '监听端口（默认 51847）')
-  .action(async (options: { port?: string }) => {
-    await runWeb({ port: options.port !== undefined ? Number(options.port) : undefined });
+  .option('--host <ip>', '追加监听 IP；可重复或用逗号分隔，配置会在后续 daemon 启动时生效', collectWebHost, [])
+  .action(async (options: { port?: string; host: string[] }) => {
+    await runWeb({ port: options.port !== undefined ? Number(options.port) : undefined, hosts: options.host });
   });
 
 // 内部命令：Web 控制台「重启 / 升级」按钮 detached spawn 的 helper 入口。脱离
