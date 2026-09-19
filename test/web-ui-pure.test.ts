@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { Script } from 'node:vm';
 import { UI_PURE_JS, UI_HTML } from '../src/web/ui';
 
 /**
@@ -27,6 +28,12 @@ const pure = new Function(
 };
 
 describe('ui.ts UI_PURE_JS 内联进 UI_HTML（同一份字符串，零漂移）', () => {
+  it('整个内联脚本可被浏览器解析', () => {
+    const script = /<script>([\s\S]*)<\/script>\s*<\/body>/.exec(UI_HTML)?.[1];
+    expect(script).toBeDefined();
+    expect(() => new Script(script!, { filename: 'inline-console.js' })).not.toThrow();
+  });
+
   it('UI_HTML 内联了 UI_PURE_JS 全文', () => {
     expect(UI_HTML).toContain(UI_PURE_JS);
   });

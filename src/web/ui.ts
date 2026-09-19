@@ -1835,7 +1835,7 @@ ${UI_PURE_JS}
         (b.running ? '运行中' + (b.pid ? ' · pid ' + b.pid : '') : '未在运行') +
         ' · ' + ((b.kind || 'project') === 'personal'
           ? ((b.personal && b.personal.sessionCount) || 0) + ' 个个人会话'
-          : ((b.projects && b.projects.length) || 0) + ' 个项目'));
+          : ((b.projects && b.projects.length) || 0) + ' 个项目')));
       row.appendChild(grow);
       // 已启用 ≠ 已上线：加进活跃集了，但 Feishu Bridge 没在跑就不会真正连上。明确提示别误会。
       if (b.active && daemon && !daemon.running) {
