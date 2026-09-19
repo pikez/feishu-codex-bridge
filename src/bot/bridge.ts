@@ -2,6 +2,7 @@ import { createLarkChannel, Domain, type LarkChannel } from '@larksuiteoapi/node
 import type { AdminWriteOp } from '../admin/ops';
 import type { ModelInfo } from '../agent/types';
 import type { AppConfig } from '../config/schema';
+import { normalizeBotKind, type BotKind } from '../config/bot-kind';
 import { log } from '../core/logger';
 import { sep } from 'node:path';
 import { createOrchestrator } from './handle-message';
@@ -29,6 +30,8 @@ export interface BridgeOptions {
   appSecret: string;
   /** fallback cwd for groups that aren't registered projects. */
   fallbackCwd: string;
+  /** Local behavior role; the Feishu application archetype remains unchanged. */
+  kind?: BotKind;
 }
 
 export interface BridgeHandle {
@@ -51,6 +54,7 @@ export interface BridgeHandle {
  * `card.action.trigger` (lark-cli doesn't deliver it).
  */
 export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
+  const kind = normalizeBotKind(opts.kind);
   const app = opts.cfg.accounts.app;
   const channel = createLarkChannel({
     appId: app.id,
@@ -76,24 +80,26 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
     safety: { batch: { text: { delayMs: 0 } } },
   });
 
-  // Local CLI agent bridge (Claude Code / Codex hooks → owner DM). Always create
-  // the runtime object so card actions are registered even when disabled at
-  // boot; start the IPC listener only when config says it should be live.
-  const cliBridge = createCliBridgeService({
-    cfg: opts.cfg,
-    channel,
-    socketPath: paths.cliBridgeSocket,
-    isBoundProject: cwdIsBoundProject,
-  });
-  const orchestrator = createOrchestrator(channel, opts.cfg, opts.fallbackCwd, cliBridge);
+  // Local CLI agent bridge (Claude Code / Codex hooks → owner DM) exists only
+  // for project bots. Personal assistants intentionally expose no local CLI
+  // bridge surface; project bots still register its card actions when disabled.
+  const cliBridge = kind === 'project'
+    ? createCliBridgeService({
+        cfg: opts.cfg,
+        channel,
+        socketPath: paths.cliBridgeSocket,
+        isBoundProject: cwdIsBoundProject,
+      })
+    : undefined;
+  const orchestrator = createOrchestrator(channel, opts.cfg, opts.fallbackCwd, cliBridge, kind);
   channel.on('message', orchestrator.onMessage);
   channel.on('cardAction', orchestrator.dispatcher.handle);
   // Cloud-doc comments: @bot in a doc comment (drive.notice.comment_add_v1) →
   // reply in the same comment thread.
-  channel.on('comment', orchestrator.onComment);
+  if (kind === 'project') channel.on('comment', orchestrator.onComment);
   // A human added the bot to a group → DM the (admin) adder a bind card to
   // register it as a `joined` project.
-  channel.on('botAdded', orchestrator.onBotAddedToChat);
+  if (kind === 'project') channel.on('botAdded', orchestrator.onBotAddedToChat);
   // Inbound reactions (im.message.reaction.created_v1, SDK-normalized + deduped):
   // 终态 run 卡 👍 = 续轮，运行中 run/排队卡 OK/DONE = ⏹ 终止（M-6）。Without the
   // im:message.reactions:read scope the event is simply never pushed — silent off.
@@ -104,7 +110,7 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
   // without clobbering the SDK's built-ins. Guarded + best-effort — if the SDK's
   // internals change on a bump we log and degrade (manual unbind via the console's
   // 删除项目 still works; the DM console still opens by messaging the bot).
-  try {
+  if (kind === 'project') try {
     const tap = (
       channel as unknown as {
         dispatcher?: { register?: (h: Record<string, (raw: unknown) => void>) => unknown };
@@ -148,17 +154,17 @@ export async function startBridge(opts: BridgeOptions): Promise<BridgeHandle> {
   await channel.connect();
   // Never let an optional local-agent IPC bind failure (EADDRINUSE/EACCES) tear
   // down an already-connected bot — log and stay up, mirroring shutdown's catch.
-  if (shouldStartCliBridge(opts.cfg)) {
+  if (cliBridge && shouldStartCliBridge(opts.cfg)) {
     await cliBridge.start().catch((err) => log.fail('cli-bridge', err, { phase: 'start' }));
   }
-  log.info('ws', 'connected', { appId: app.id, fallbackCwd: opts.fallbackCwd });
+  log.info('ws', 'connected', { appId: app.id, kind, fallbackCwd: opts.fallbackCwd });
 
   let closed = false;
   const shutdown = async (): Promise<void> => {
     if (closed) return;
     closed = true;
     await orchestrator.shutdown();
-    await cliBridge.shutdown().catch((err) => log.fail('cli-bridge', err, { phase: 'shutdown' }));
+    await cliBridge?.shutdown().catch((err) => log.fail('cli-bridge', err, { phase: 'shutdown' }));
     await channel.disconnect().catch((err) => log.fail('ws', err, { phase: 'disconnect' }));
   };
   return {

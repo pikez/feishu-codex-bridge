@@ -22,8 +22,9 @@ import { loadConfig } from '../config/store';
 import { resolveAppSecret } from '../config/secret-resolver';
 import { diagnoseEventSubscription, type EventDiagnosis } from '../utils/event-diagnosis';
 import { validateAppCredentials } from '../utils/feishu-auth';
-import { buildScopeGrantUrl, buildEventConfigUrl } from '../config/scopes';
+import { buildScopeGrantUrl, buildEventConfigUrl, grantScopesFor } from '../config/scopes';
 import { registerBotFromCredentials } from '../bot/register-bot';
+import type { BotKind } from '../config/bot-kind';
 import {
   startRegistration,
   registrationErrorCode,
@@ -59,7 +60,7 @@ import {
 } from '../service/update';
 import { bridgeVersion } from '../core/version';
 import { collectHostDoctor, toDaemonStatus, type DaemonStatus, type HostDoctor } from './host';
-import type { AdminWriteOp } from './ops';
+import { AdminWriteError, type AdminWriteOp } from './ops';
 
 /**
  * 管理面共享服务层（设计：.plans/auto-optimize/design/admin-surface.md）。
@@ -127,6 +128,8 @@ export interface AdminService {
   ): Promise<void>;
   /** 🪪 每 bot 的发信人身份上下文开关（写）；影响下一条 Agent 输入。 */
   setSenderIdentity(botId: string, on: boolean): Promise<void>;
+  /** Replace a personal assistant's explicit collaborator allowlist. */
+  setPersonalAllowedUsers(botId: string, users: string[]): Promise<void>;
   /** 🩺 对全部注册后端做环境体检（doctor 探测，绝不抛错）。 */
   doctorBackends(): Promise<AdminBackendStatus[]>;
   /** 事件订阅三态诊断（ok / missing / unpublished / unchecked，绝不抛错）。 */
@@ -155,6 +158,8 @@ export interface AdminService {
     signal: AbortSignal;
     onQr: (info: RegistrationQr) => void;
     onStatus?: (info: RegistrationStatus) => void;
+    kind?: BotKind;
+    personalCwd?: string;
   }): Promise<QrRegisterResult | QrRegisterFailure>;
 
   // ── Web 专属：后端 catalog 预览 + 按需安装（backend-catalog-ondemand.md）──────
@@ -262,6 +267,10 @@ export interface AdminBot {
   appId: string;
   tenant: 'feishu' | 'lark';
   botName?: string;
+  /** Local behavior profile, independent of Feishu's PersonalAgent archetype. */
+  kind?: BotKind;
+  /** Present only for a personal assistant; intentionally no project details. */
+  personal?: { cwd?: string; allowedUsers?: string[]; allowedUsersCount: number; sessionCount: number };
   /** run/start 会带起它（bot use 的多选活跃集） */
   active: boolean;
   /** bots.json 的 current（单 bot 代码路径的主 bot） */
@@ -367,6 +376,7 @@ export interface QrRegisterResult {
   name: string;
   tenant: 'feishu' | 'lark';
   botName?: string;
+  kind?: BotKind;
   /** 扫码人 open_id（已落成 owner+admin）。 */
   adminOpenId: string;
   /** 必需 scope 中尚未授权的（undefined = 没查成；空 = 已齐全）。 */
@@ -561,16 +571,30 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       const configured = reg.bots.some((b) => b.active !== undefined);
       const out: AdminBot[] = [];
       for (const b of reg.bots) {
-        const [run, completionReminder, senderIdentityEnabled] = await Promise.all([
+        const [run, completionReminder, senderIdentityEnabled, cfg, sessions] = await Promise.all([
           runState(b.appId),
           completionReminderFor(b.appId),
           senderIdentityEnabledFor(b.appId),
+          loadConfig(botPaths(b.appId).configFile).catch(() => undefined),
+          listSessionsIn(botPaths(b.appId).sessionsFile).catch(() => []),
         ]);
+        const kind = b.kind === 'personal' ? 'personal' : 'project';
         out.push({
           name: b.name,
           appId: b.appId,
           tenant: b.tenant,
           botName: b.botName,
+          kind,
+          ...(kind === 'personal'
+            ? {
+                personal: {
+                  cwd: (cfg as AppConfig | undefined)?.preferences?.personal?.cwd,
+                  allowedUsers: (cfg as AppConfig | undefined)?.preferences?.personal?.allowedUsers ?? [],
+                  allowedUsersCount: (cfg as AppConfig | undefined)?.preferences?.personal?.allowedUsers?.length ?? 0,
+                  sessionCount: sessions.filter((s) => Boolean(s.personalUserId)).length,
+                },
+              }
+            : {}),
           // 与 config/bots.activeBots 同语义：从未配置过活跃集 → 回退 current。
           active: configured ? b.active === true : reg.current === b.appId,
           current: reg.current === b.appId,
@@ -652,6 +676,12 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       await executeWrite(botId, '🪪 发信人身份上下文', { kind: 'setSenderIdentity', on });
     },
 
+    async setPersonalAllowedUsers(botId: string, users: string[]): Promise<void> {
+      const entry = (await loadBots()).bots.find((bot) => bot.appId === botId);
+      if (entry?.kind !== 'personal') throw new AdminWriteError('该机器人不是个人助理，不能管理个人白名单');
+      await executeWrite(botId, '👥 个人助理白名单', { kind: 'setPersonalAllowedUsers', users });
+    },
+
     doctorBackends(): Promise<AdminBackendStatus[]> {
       return probeAllBackends();
     },
@@ -695,6 +725,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       const reg = await loadBots();
       const entry = reg.bots.find((b) => b.appId === botId);
       const tenant: 'feishu' | 'lark' = entry?.tenant ?? 'feishu';
+      const kind: BotKind = entry?.kind === 'personal' ? 'personal' : 'project';
       const base: Pick<AdminSetupStatus, 'appId' | 'tenant' | 'botName' | 'eventConfigUrl'> = {
         appId: botId,
         tenant,
@@ -718,7 +749,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
           credentials: { ok: false, reason: '配置缺失（该机器人尚未完成注册或文件损坏）' },
           connection: { running: run.running, connection: run.connection },
           event: { state: 'unchecked', reason: '配置缺失，无法诊断事件订阅' },
-          scopes: { grantUrl: buildScopeGrantUrl(botId, tenant) },
+          scopes: { grantUrl: buildScopeGrantUrl(botId, tenant, grantScopesFor(kind)) },
         };
       }
 
@@ -732,14 +763,14 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
           credentials: { ok: false, reason: err instanceof Error ? err.message : String(err) },
           connection: { running: run.running, connection: run.connection },
           event: { state: 'unchecked', reason: '密钥不可解析' },
-          scopes: { grantUrl: buildScopeGrantUrl(botId, tenant) },
+          scopes: { grantUrl: buildScopeGrantUrl(botId, tenant, grantScopesFor(kind)) },
         };
       }
 
       const { app } = cfg.accounts;
       // ①+④ 探活同时拿 botName / missingScopes；③ 事件诊断并发。各自绝不抛错。
       const [validation, event] = await Promise.all([
-        validateAppCredentials(app.id, secret, app.tenant).catch((err) => ({
+        validateAppCredentials(app.id, secret, app.tenant, kind).catch((err) => ({
           ok: false as const,
           reason: err instanceof Error ? err.message : String(err),
         })),
@@ -756,7 +787,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
         event,
         scopes: {
           missingRequired: validation.ok ? validation.missingScopes : undefined,
-          grantUrl: buildScopeGrantUrl(app.id, app.tenant),
+          grantUrl: buildScopeGrantUrl(app.id, app.tenant, grantScopesFor(kind)),
         },
       };
     },
@@ -767,7 +798,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
       // ① 扫码会话：透传 onQr/onStatus 给上层做 SSE；signal 取消 → SDK reject code='abort'。
       let creds;
       try {
-        creds = await startRegistration({ signal: opts.signal, onQr: opts.onQr, onStatus: opts.onStatus });
+        creds = await startRegistration({ signal: opts.signal, onQr: opts.onQr, onStatus: opts.onStatus }, opts.kind ?? 'project');
       } catch (err) {
         const code = registrationErrorCode(err);
         return mapQrFailure(code, registrationErrorMessage(err));
@@ -787,6 +818,8 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
         appSecret: creds.clientSecret,
         tenant: creds.tenant,
         ownerOpenId,
+        ...(opts.kind ? { kind: opts.kind } : {}),
+        ...(opts.personalCwd ? { personalCwd: opts.personalCwd } : {}),
       });
       if (!r.ok) {
         // 写盘 / 探活失败 → 据 register-bot 的 code 映射（invalid_input 理论不该出现，
@@ -801,6 +834,7 @@ export function createAdminService(deps: AdminServiceDeps = {}): AdminService {
         name: r.name,
         tenant: r.tenant,
         botName: r.botName,
+        kind: r.kind,
         adminOpenId: ownerOpenId,
         missingScopes: r.missingScopes,
       };

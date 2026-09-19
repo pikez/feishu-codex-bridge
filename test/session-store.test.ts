@@ -6,11 +6,14 @@ import {
   clearSessionTitleJobKey,
   createSessionTitleJob,
   getSession,
+  getActivePersonalSession,
+  listPersonalSessions,
   getSessionTitleJob,
   listSessions,
   listSessionTitleJobs,
   patchSession,
   sessionTitleJobKey,
+  setActivePersonalSession,
   updateSessionTitleJob,
   upsertSession,
   type SessionRecord,
@@ -118,10 +121,28 @@ describe('session-store', () => {
     // 写回（patch 任意字段）后落盘的是新字段名 + 回填的 backend + 新文件版本
     await patchSession('old-topic', { model: 'gpt-5.5' });
     const onDisk = JSON.parse(await readFile(paths.sessionsFile, 'utf8'));
-    expect(onDisk.version).toBe(3);
+    expect(onDisk.version).toBe(4);
     expect(onDisk.sessions[0].sessionId).toBe('cx-legacy');
     expect(onDisk.sessions[0].backend).toBe('codex-appserver');
     expect(onDisk.titleJobs).toEqual([]);
+  });
+
+  it('keeps personal sessions per user and persists the selected conversation', async () => {
+    await upsertSession({
+      ...rec('personal:ou_owner:one', 'cx-owner-1'),
+      personalUserId: 'ou_owner',
+      personalConversationId: 'one',
+      personalTitle: '研究计划',
+    });
+    await upsertSession({
+      ...rec('personal:ou_guest:one', 'cx-guest-1'),
+      personalUserId: 'ou_guest',
+      personalConversationId: 'one',
+    });
+    expect(await setActivePersonalSession('ou_owner', 'personal:ou_owner:one')).toBe(true);
+    expect(await setActivePersonalSession('ou_guest', 'personal:ou_owner:one')).toBe(false);
+    expect((await getActivePersonalSession('ou_owner'))?.sessionId).toBe('cx-owner-1');
+    expect((await listPersonalSessions('ou_owner')).map((s) => s.threadId)).toEqual(['personal:ou_owner:one']);
   });
 
   it('keeps an explicit stored backend as-is (no backfill clobber)', async () => {
@@ -161,7 +182,7 @@ describe('session-store', () => {
     // backend session the bridge cannot safely prove it owns.
     await patchSession('old-v2-topic', { summary: 'updated' });
     const onDisk = JSON.parse(await readFile(paths.sessionsFile, 'utf8'));
-    expect(onDisk.version).toBe(3);
+    expect(onDisk.version).toBe(4);
     expect(onDisk.titleJobs).toEqual([]);
   });
 

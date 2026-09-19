@@ -4,7 +4,9 @@ import { botPaths } from '../config/paths';
 import { isComplete, secretKeyForApp, type AppPreferences, type TenantBrand } from '../config/schema';
 import { validateAppCredentials } from '../utils/feishu-auth';
 import { addBot, loadBots, uniqueName } from '../config/bots';
+import { normalizeBotKind, type BotKind } from '../config/bot-kind';
 import { log } from '../core/logger';
+import { resolvePersonalCwd } from './personal';
 
 /**
  * 扫码注册拿到凭据后的共享落盘函数。Web 扫码在 daemon 进程内调用，不能复用
@@ -27,6 +29,10 @@ export interface RegisterBotInput {
   desiredName?: string;
   /** 扫码注册者的 open_id；必填并落成 owner+admin，禁止保存无管理员配置。 */
   ownerOpenId: string;
+  /** Local behavior profile. Omitted registrations retain project behavior. */
+  kind?: BotKind;
+  /** Required for a personal bot; validated before credentials are persisted. */
+  personalCwd?: string;
 }
 
 export interface RegisterBotResult {
@@ -35,6 +41,7 @@ export interface RegisterBotResult {
   appId: string;
   tenant: TenantBrand;
   botName?: string;
+  kind: BotKind;
   /** 必需 scope 中尚未授权的（undefined = 没查成；空 = 已齐全）。 */
   missingScopes?: string[];
 }
@@ -63,6 +70,7 @@ export async function registerBotFromCredentials(
   const appSecret = input.appSecret?.trim() ?? '';
   const ownerOpenId = input.ownerOpenId?.trim() ?? '';
   const tenant: TenantBrand = input.tenant === 'lark' ? 'lark' : 'feishu';
+  const kind = normalizeBotKind(input.kind);
 
   if (!appId || !appSecret) {
     return { ok: false, code: 'invalid_input', reason: 'App ID 与 App Secret 都不能为空。' };
@@ -82,8 +90,20 @@ export async function registerBotFromCredentials(
     };
   }
 
+  let personalCwd: string | undefined;
+  if (kind === 'personal') {
+    personalCwd = await validatePersonalCwd(input.personalCwd);
+    if (!personalCwd) {
+      return { ok: false, code: 'invalid_input', reason: '个人助理机器人必须提供一个存在且可访问的绝对工作目录。' };
+    }
+  }
+
   // 真探活：换 tenant_access_token，密钥无效直接拒绝——不让坏密钥落进 keystore。
-  const v = await validate(appId, appSecret, tenant);
+  // Keep the legacy three-argument validator seam intact for project bots;
+  // personal registrations opt into the narrower scope validation explicitly.
+  const v = kind === 'personal'
+    ? await validate(appId, appSecret, tenant, kind)
+    : await validate(appId, appSecret, tenant);
   if (!v.ok) {
     return {
       ok: false,
@@ -103,16 +123,16 @@ export async function registerBotFromCredentials(
     const existing = await loadConfig(files.configFile);
     const basePrefs = isComplete(existing) ? existing.preferences : undefined;
     // 扫码人 open_id → 落成 owner+admin（与 CLI wizard 对齐）。
-    const preferences = withOwnerAdmin(basePrefs, ownerOpenId);
+    const preferences = withOwnerAdmin(basePrefs, ownerOpenId, kind === 'personal' ? personalCwd : undefined);
     const cfg = await buildEncryptedAccountConfig(appId, tenant, preferences);
     await saveConfig(cfg, files.configFile);
 
     const reg = await loadBots();
     const name = uniqueName(reg, input.desiredName ?? v.botName ?? appId);
-    await addBot({ name, appId, tenant, botName: v.botName, createdAt: Date.now() });
+    await addBot({ name, appId, tenant, botName: v.botName, kind, createdAt: Date.now() });
 
     log.info('register-bot', 'bot-registered', { name, appId, bot: v.botName ?? null });
-    return { ok: true, name, appId, tenant, botName: v.botName, missingScopes: v.missingScopes };
+    return { ok: true, name, appId, tenant, botName: v.botName, kind, missingScopes: v.missingScopes };
   } catch (err) {
     log.fail('register-bot', err, { phase: 'persist', appId });
     return {
@@ -128,12 +148,25 @@ export async function registerBotFromCredentials(
  * 与 access 字段，幂等：admins 去重）。owner 恒入 admins（与 schema 注释
  * 「ownerOpenId 恒为 admin」一致）。
  */
-function withOwnerAdmin(base: AppPreferences | undefined, ownerOpenId: string): AppPreferences {
+function withOwnerAdmin(base: AppPreferences | undefined, ownerOpenId: string, personalCwd?: string): AppPreferences {
   const access = base?.access;
   const admins = new Set(access?.admins ?? []);
   admins.add(ownerOpenId);
   return {
     ...base,
     access: { ...access, ownerOpenId, admins: [...admins] },
+    ...(personalCwd
+      ? {
+          personal: {
+            ...base?.personal,
+            cwd: personalCwd,
+            allowedUsers: (base?.personal?.allowedUsers ?? []).filter((id) => id !== ownerOpenId),
+          },
+        }
+      : {}),
   };
+}
+
+async function validatePersonalCwd(value: string | undefined): Promise<string | undefined> {
+  return resolvePersonalCwd(value?.trim());
 }

@@ -105,8 +105,10 @@ const bot = program.command('bot').description('飞书机器人管理（多机�
 bot
   .command('init [name]')
   .description('扫码注册一个飞书机器人并授权（可选短名）')
-  .action(async (name?: string) => {
-    await runBotInit(name);
+  .option('--kind <personal|project>', '机器人角色；未提供时在终端选择')
+  .option('--cwd <path>', 'personal 的固定工作目录（必须为存在的绝对路径）')
+  .action(async (name: string | undefined, options: { kind?: string; cwd?: string }) => {
+    await runBotInit(name, options);
   });
 bot
   .command('list')

@@ -54,7 +54,8 @@ export type AdminWriteOp =
       mode: CompletionReminderMode;
       longTaskMinutes: number;
     }
-  | { kind: 'setSenderIdentity'; on: boolean };
+  | { kind: 'setSenderIdentity'; on: boolean }
+  | { kind: 'setPersonalAllowedUsers'; users: string[] };
 
 /** 写操作被校验拒绝（中文原因可直接上卡/上 HTTP body）。HTTP 层映射 409；
  * IPC 层凭 code 还原类型。 */
@@ -74,6 +75,7 @@ export type AdminWriteOutcome = { ok: true; project: Project } | { ok: false; re
 export type AdminPreferencesWriteOutcome =
   | { ok: true; completionReminder: ResolvedCompletionReminderConfig }
   | { ok: true; senderIdentityEnabled: boolean }
+  | { ok: true; personalAllowedUsers: string[] }
   | { ok: false; reason: string };
 
 /**
@@ -375,6 +377,25 @@ export async function performSetSenderIdentity(opts: {
   return { ok: true, senderIdentityEnabled: getIncludeSenderIdentity(opts.cfg) };
 }
 
+/** Replace the explicit collaborator allowlist for a personal assistant. The
+ * owner is deliberately implicit and therefore stripped from persisted state. */
+export async function performSetPersonalAllowedUsers(opts: {
+  cfg: AppConfig;
+  users: string[];
+  writePreferences?: AppPreferencesWriter;
+}): Promise<AdminPreferencesWriteOutcome> {
+  if (!Array.isArray(opts.users) || opts.users.some((u) => typeof u !== 'string')) {
+    return { ok: false, reason: '白名单必须是 open_id 字符串数组' };
+  }
+  const owner = opts.cfg.preferences?.access?.ownerOpenId ?? opts.cfg.preferences?.access?.admins?.[0];
+  const users = [...new Set(opts.users.map((u) => u.trim()).filter((u) => u.length > 0 && u !== owner))];
+  const writePreferences = opts.writePreferences ?? createAppPreferencesWriter({ cfg: opts.cfg });
+  await writePreferences((preferences) => {
+    preferences.personal = { ...(preferences.personal ?? {}), allowedUsers: users };
+  });
+  return { ok: true, personalAllowedUsers: users };
+}
+
 export interface AdminWriteExecutorDeps {
   backendFor: (id?: string) => AgentBackend;
   evictLiveSessionsForChat: (chatId: string) => Promise<void>;
@@ -451,5 +472,8 @@ export async function runAdminWriteOp(
         persistConfig: deps.persistConfig,
         writePreferences: deps.writePreferences,
       });
+    case 'setPersonalAllowedUsers':
+      if (!deps.cfg) return { ok: false, reason: 'bot 运行配置不可用，无法即时更新个人助理白名单' };
+      return performSetPersonalAllowedUsers({ cfg: deps.cfg, users: op.users, writePreferences: deps.writePreferences });
   }
 }

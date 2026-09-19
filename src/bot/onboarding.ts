@@ -18,10 +18,15 @@ import { openUrl } from '../utils/open-url';
 import { log } from '../core/logger';
 import { useBotDir } from '../config/paths';
 import { ensureRegistry, addBot, currentBot, findBot, loadBots, uniqueName, type BotEntry } from '../config/bots';
+import { type BotKind } from '../config/bot-kind';
+import { resolvePersonalCwd } from './personal';
+import { grantScopesFor } from '../config/scopes';
 
 export interface OnboardResult {
   cfg: AppConfig;
   secret: string;
+  /** Registry identity determines the bridge's local behavior role. */
+  bot: BotEntry;
   /** required scopes still ungranted at validation time (undefined = couldn't check). */
   missingScopes?: string[];
   /** 事件订阅诊断（版本信息 API，三态 + unchecked 降级；undefined = 没跑诊断）。 */
@@ -98,9 +103,9 @@ export async function ensureOnboarded(
     console.error(`✗ 当前机器人「${entry.name}」(${entry.appId}) 配置缺失或损坏。可 \`bot rm ${entry.name}\` 后重新 \`bot init\`。`);
     return null;
   }
-  const r = await validateAndReport(cfg);
+  const r = await validateAndReport(cfg, entry.kind);
   if (r === null) return null;
-  return { cfg, secret: r.secret, missingScopes: r.missingScopes, events: r.events };
+  return { cfg, secret: r.secret, bot: entry, missingScopes: r.missingScopes, events: r.events };
 }
 
 /**
@@ -109,7 +114,15 @@ export async function ensureOnboarded(
  * `desiredName` defaults to the bot's display name (slugified); pass `'default'`
  * for the implicit first-run from `run`/`start`. Returns null on failure.
  */
-export async function registerNewBot(desiredName?: string): Promise<OnboardResult | null> {
+export interface RegisterNewBotOptions {
+  kind?: BotKind;
+  personalCwd?: string;
+}
+
+export async function registerNewBot(
+  desiredName?: string,
+  options: RegisterNewBotOptions = {},
+): Promise<OnboardResult | null> {
   // The scan needs a human at a terminal. A headless context (the launchd
   // service, CI) must never enter the wizard — `registerApp` would print a QR
   // to a log nobody reads and poll forever. Fail fast with a pointer instead.
@@ -121,7 +134,9 @@ export async function registerNewBot(desiredName?: string): Promise<OnboardResul
     return null;
   }
 
-  const wizardCfg = await runRegistrationWizard();
+  const profile = await resolveRegistrationProfile(options);
+  if (!profile) return null;
+  const wizardCfg = await runRegistrationWizard(profile.kind);
   const app = wizardCfg.accounts.app;
   if (typeof app.secret !== 'string') {
     console.error('✗ 向导未返回明文密钥，无法继续。');
@@ -130,7 +145,7 @@ export async function registerNewBot(desiredName?: string): Promise<OnboardResul
 
   // Validate with the plaintext secret before persisting — bad creds shouldn't
   // leave a half-registered bot behind.
-  const v = await validateAppCredentials(app.id, app.secret, app.tenant);
+  const v = await validateAppCredentials(app.id, app.secret, app.tenant, profile.kind);
   if (!v.ok) {
     console.error(`✗ 应用凭据校验失败：${v.reason}`);
     return null;
@@ -138,21 +153,52 @@ export async function registerNewBot(desiredName?: string): Promise<OnboardResul
 
   await setSecret(secretKeyForApp(app.id), app.secret);
   useBotDir(app.id); // from here all per-bot files land under bots/<appId>/
-  const cfg = await buildEncryptedAccountConfig(app.id, app.tenant, wizardCfg.preferences);
+  const cfg = await buildEncryptedAccountConfig(app.id, app.tenant, {
+    ...wizardCfg.preferences,
+    ...(profile.personalCwd ? { personal: { ...wizardCfg.preferences?.personal, cwd: profile.personalCwd } } : {}),
+  });
   await saveConfig(cfg);
 
   const reg = await loadBots();
   const name = uniqueName(reg, desiredName ?? v.botName ?? 'default');
-  await addBot({ name, appId: app.id, tenant: app.tenant, botName: v.botName, createdAt: Date.now() });
+  await addBot({ name, appId: app.id, tenant: app.tenant, botName: v.botName, kind: profile.kind, createdAt: Date.now() });
 
   console.log(`✓ 已创建机器人「${name}」  bot: ${v.botName ?? '-'}  appId: ${app.id}`);
   log.info('onboard', 'bot-created', { name, appId: app.id, bot: v.botName ?? null });
-  noticeMissingScopes(cfg, v.missingScopes);
+  noticeMissingScopes(cfg, v.missingScopes, profile.kind);
   const events = await diagnoseEventSubscription(app.id, app.secret, app.tenant);
   noticeEventDiagnosis(cfg, events);
 
   const secret = await resolveAppSecret(cfg);
-  return { cfg, secret, missingScopes: v.missingScopes, events };
+  return {
+    cfg,
+    secret,
+    bot: { name, appId: app.id, tenant: app.tenant, botName: v.botName, kind: profile.kind, createdAt: Date.now() },
+    missingScopes: v.missingScopes,
+    events,
+  };
+}
+
+async function resolveRegistrationProfile(
+  options: RegisterNewBotOptions,
+): Promise<{ kind: BotKind; personalCwd?: string } | null> {
+  let kind = options.kind;
+  if (!kind) {
+    const answer = (await promptLine('机器人角色（project=项目协作，personal=个人助理）[project]： ')).trim().toLowerCase();
+    kind = answer === 'personal' ? 'personal' : answer === '' || answer === 'project' ? 'project' : undefined;
+    if (!kind) {
+      console.error('✗ 机器人角色只能是 project 或 personal。');
+      return null;
+    }
+  }
+  if (kind !== 'personal') return { kind: 'project' };
+  const supplied = options.personalCwd?.trim() || (await promptLine('个人助理工作目录（必须是存在的绝对路径）： ')).trim();
+  const personalCwd = await resolvePersonalCwd(supplied);
+  if (!personalCwd) {
+    console.error('✗ 个人助理必须提供一个存在且可访问的绝对工作目录。');
+    return null;
+  }
+  return { kind, personalCwd };
 }
 
 /** Resolve secret, validate credentials, report result; on missing scopes,
@@ -160,9 +206,10 @@ export async function registerNewBot(desiredName?: string): Promise<OnboardResul
  *  event-subscription diagnosis and report it too (same notice-only policy). */
 async function validateAndReport(
   cfg: AppConfig,
+  kind: BotKind = 'project',
 ): Promise<{ secret: string; missingScopes?: string[]; events: EventDiagnosis } | null> {
   const secret = await resolveAppSecret(cfg);
-  const v = await validateAppCredentials(cfg.accounts.app.id, secret, cfg.accounts.app.tenant);
+  const v = await validateAppCredentials(cfg.accounts.app.id, secret, cfg.accounts.app.tenant, kind);
   if (!v.ok) {
     console.error(`✗ 应用凭据校验失败：${v.reason}`);
     console.error('  应用可能被禁用/未发布；可重跑 `feishu-codex-bridge bot init` 重新扫码。');
@@ -170,7 +217,7 @@ async function validateAndReport(
   }
   console.log(`✓ 凭据校验通过  bot: ${v.botName ?? '-'}  appId: ${cfg.accounts.app.id}`);
   log.info('onboard', 'credentials-ok', { appId: cfg.accounts.app.id, bot: v.botName ?? null });
-  noticeMissingScopes(cfg, v.missingScopes);
+  noticeMissingScopes(cfg, v.missingScopes, kind);
   const events = await diagnoseEventSubscription(cfg.accounts.app.id, secret, cfg.accounts.app.tenant);
   noticeEventDiagnosis(cfg, events);
   return { secret, missingScopes: v.missingScopes, events };
@@ -191,6 +238,7 @@ async function validateAndReport(
 export async function confirmReadyForDaemon(result: OnboardResult): Promise<boolean> {
   if (!process.stdin.isTTY) return true;
   const { app } = result.cfg.accounts;
+  const personal = result.bot.kind === 'personal';
 
   // 诊断已确认事件订阅生效 → 不再甩整面墙的手动步骤，只留一条无法检测的回调提醒。
   if (result.events?.state === 'ok') {
@@ -212,6 +260,15 @@ export async function confirmReadyForDaemon(result: OnboardResult): Promise<bool
   console.log('\n最后这几步飞书没有写入 API/深链可代办（只能查、不能配），需你手动点：\n');
   console.log(`  【1】事件与回调（${opened ? '已自动打开' : '打开下面链接'}）：${eventUrl}`);
   console.log('       这页顶部有三个标签：「事件配置」「回调配置」「加密策略」。');
+  if (personal) {
+    console.log('       • 切到「事件配置」→ 订阅方式改「长连接」→ 添加：');
+    console.log('           im.message.receive_v1（接收私聊）/ im.message.reaction.created_v1（运行状态表情）');
+    console.log('       • 切到「回调配置」→ 订阅方式改「长连接」→ 添加：card.action.trigger（卡片交互）。');
+    console.log('       • 个人助理不需要群、项目绑定或云文档评论事件。');
+    console.log('  【2】左侧栏「应用发布 → 版本管理与发布」→ 创建一个版本并发布。');
+    await promptEnter('\n以上都点完后按 Enter 安装后台服务（Ctrl+C 取消）… ');
+    return true;
+  }
   console.log('       • 切到「事件配置」标签 → 「订阅方式」改「长连接」→ 点「添加事件」搜并勾选：');
   console.log('           im.message.receive_v1（接收消息）、application.bot.menu_v6（机器人菜单）');
   console.log('       • （可选）想要「在飞书文档评论里 @机器人就自动回复」，再加这一个事件：');
@@ -235,6 +292,10 @@ export async function confirmReadyForDaemon(result: OnboardResult): Promise<bool
 }
 
 async function promptEnter(message: string): Promise<string> {
+  return promptLine(message);
+}
+
+async function promptLine(message: string): Promise<string> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     return await rl.question(message);
@@ -249,13 +310,13 @@ async function promptEnter(message: string): Promise<string> {
  * 授权页（{@link openUrl} 自身在非 TTY 直接 no-op，所以 codex / supervisor 子进程 /
  * daemon 不会弹浏览器、只打印链接）。missingScopes 三态：undefined=没查成、空=已齐全。
  */
-function noticeMissingScopes(cfg: AppConfig, missingScopes: string[] | undefined): void {
+function noticeMissingScopes(cfg: AppConfig, missingScopes: string[] | undefined, kind: BotKind = 'project'): void {
   if (missingScopes === undefined) {
     log.info('onboard', 'scope-check-skipped', { reason: 'scope list unavailable' });
     return;
   }
   if (missingScopes.length === 0) return;
-  const url = buildScopeGrantUrl(cfg.accounts.app.id, cfg.accounts.app.tenant);
+  const url = buildScopeGrantUrl(cfg.accounts.app.id, cfg.accounts.app.tenant, grantScopesFor(kind));
   const opened = openUrl(url); // TTY → 开浏览器并返回 true；非 TTY → 不开、返回 false
   // 纯 ASCII 边框：`-` 在 UTF-8 与 GBK 下编码相同，老式 cmd.exe（CP936）也不会乱码。
   const rule = '-'.repeat(64);

@@ -1,4 +1,6 @@
-import { rmSync, readFileSync, existsSync } from 'node:fs';
+import { rmSync, readFileSync, existsSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { realpathSync } from 'node:fs';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // 把整个 ~/.feishu-codex-bridge 指到临时目录——keystore(secrets.enc/.salt) +
@@ -131,7 +133,45 @@ describe('registerBotFromCredentials · 注册落盘', () => {
     expect(entry).toBeTruthy();
     expect(entry!.tenant).toBe('feishu');
     expect(entry!.botName).toBe('阿尔法机器人');
+    expect(entry!.kind).toBe('project');
     expect(reg.current).toBe('cli_alpha12345'); // 首个注册成为 current
+  });
+
+  it('个人助理需要真实绝对目录，并原子保存 kind 与 personalCwd', async () => {
+    const cwd = mkdtempSync(`${tmpdir()}/personal-bot-cwd-`);
+    const r = await registerBotFromCredentials(
+      {
+        appId: 'cli_personal1234',
+        appSecret: 'secret',
+        tenant: 'feishu',
+        ownerOpenId: 'ou_owner',
+        kind: 'personal',
+        personalCwd: cwd,
+      },
+      okValidate,
+    );
+    expect(r).toMatchObject({ ok: true, kind: 'personal' });
+    const entry = (await loadBots()).bots.find((b) => b.appId === 'cli_personal1234');
+    expect(entry?.kind).toBe('personal');
+    const cfg = JSON.parse(readFileSync(botPaths('cli_personal1234').configFile, 'utf8'));
+    expect(cfg.preferences.personal.cwd).toBe(realpathSync(cwd));
+    rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it('个人助理缺少有效工作目录时不保存凭据或注册表', async () => {
+    const r = await registerBotFromCredentials(
+      {
+        appId: 'cli_personalbad1',
+        appSecret: 'secret',
+        tenant: 'feishu',
+        ownerOpenId: 'ou_owner',
+        kind: 'personal',
+        personalCwd: 'relative/path',
+      },
+      okValidate,
+    );
+    expect(r).toMatchObject({ ok: false, code: 'invalid_input' });
+    expect((await loadBots()).bots.find((b) => b.appId === 'cli_personalbad1')).toBeUndefined();
   });
 
   it('幂等：同 appId 重复扫码覆盖 keystore 密钥，不产生重复 entry', async () => {

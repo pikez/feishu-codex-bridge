@@ -1,6 +1,7 @@
 import { registerApp } from '@larksuiteoapi/node-sdk';
 import qrcode from 'qrcode-terminal';
 import type { AppConfig, TenantBrand } from '../config/schema';
+import type { BotKind } from '../config/bot-kind';
 
 /**
  * Scan-QR onboarding 的**共享启动器**：把 SDK 的 `registerApp` 异步轮询封成一个
@@ -55,19 +56,20 @@ export interface StartRegistrationOptions {
 /** 扫码后的创建页预填（用户仍可改；`{user}` 由飞书替换为扫码人姓名）。
  * QR 预填仅支持 avatar/name/desc——scope 与事件没有任何预填通道（见 config/scopes.ts），
  * avatar 需公网图床 URL，这里不带。命令行与 Web 共用同一预填，文案不漂移。 */
-const APP_PRESET = {
-  name: 'Codex Bridge',
-  desc: '{user} 的 Codex 助手：群里 @我，就在绑定的项目目录里干活（feishu-codex-bridge）',
-} as const;
+function appPreset(kind: BotKind): { name: string; desc: string } {
+  return kind === 'personal'
+    ? { name: 'Codex Personal Assistant', desc: '{user} 的 Codex 个人助理：私聊即可在本机工作区协作（feishu-codex-bridge）' }
+    : { name: 'Codex Bridge', desc: '{user} 的 Codex 助手：群里 @我，就在绑定的项目目录里干活（feishu-codex-bridge）' };
+}
 
 /**
  * 发起一次扫码注册会话。resolve 拿到明文凭据；失败 reject 的对象其 `.code` 可用
  * {@link registrationErrorCode} 读出（'abort'|'expired_token'|'access_denied'|...）。
  * 不打印任何东西、不写盘——纯封装 registerApp，让 CLI / Web 各自决定怎么呈现。
  */
-export async function startRegistration(opts: StartRegistrationOptions): Promise<RegistrationCredentials> {
+export async function startRegistration(opts: StartRegistrationOptions, kind: BotKind = 'project'): Promise<RegistrationCredentials> {
   const result = await registerApp({
-    appPreset: { ...APP_PRESET },
+    appPreset: appPreset(kind),
     signal: opts.signal,
     onQRCodeReady: (info) => opts.onQr({ url: info.url, expireIn: info.expireIn }),
     onStatusChange: (info) => opts.onStatus?.({ status: info.status, interval: info.interval }),
@@ -104,7 +106,7 @@ export function registrationErrorMessage(err: unknown): string {
  * 明文 client_secret 的 AppConfig（调用方移进 keystore）。扫码人 open_id 必须落成
  * owner+admin；缺失时拒绝返回配置，避免产生无人可管理的机器人。
  */
-export async function runRegistrationWizard(): Promise<AppConfig> {
+export async function runRegistrationWizard(kind: BotKind = 'project'): Promise<AppConfig> {
   console.log('\n未检测到飞书应用配置，进入扫码创建向导。\n');
 
   const creds = await startRegistration({
@@ -122,7 +124,7 @@ export async function runRegistrationWizard(): Promise<AppConfig> {
         console.log('轮询速度过快，已自动降速。');
       }
     },
-  });
+  }, kind);
 
   console.log('\n✓ 应用创建成功');
   console.log(`  App ID:  ${creds.clientId}`);

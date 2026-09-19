@@ -4,6 +4,8 @@ import { mkdirSync, watch, type FSWatcher } from 'node:fs';
 import { open, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { paths } from '../config/paths';
+import { resolvePersonalCwd } from '../bot/personal';
+import type { BotKind } from '../config/bot-kind';
 import {
   COMPLETION_REMINDER_LONG_TASK_MAX_MINUTES,
   COMPLETION_REMINDER_LONG_TASK_MIN_MINUTES,
@@ -114,6 +116,9 @@ export function createWebServer(opts: WebServerOptions): WebServer {
    * 不会被僵尸会话卡住。SSE 断开（req.on('close')）→ abort 兜底，杜绝僵尸轮询打飞书。
    */
   let qrSession: { id: string; abort: AbortController } | null = null;
+  /** Short-lived local registration profile. The workspace path stays in this
+   * process memory and is passed to SSE by opaque id, never put in a URL. */
+  const registrationIntents = new Map<string, { kind: BotKind; personalCwd?: string; expiresAt: number }>();
 
   const handleRequest = (req: IncomingMessage, res: ServerResponse): void => {
     void handle(req, res).catch((err) => {
@@ -312,6 +317,29 @@ export function createWebServer(opts: WebServerOptions): WebServer {
     }
 
     // ── Web 专属：扫码初始化 / 添加机器人（day-0）───────────────────────────
+    if (req.method === 'POST' && pathName === '/api/bots/register-intents') {
+      let body: Record<string, unknown>;
+      try {
+        body = await readJsonBody(req);
+      } catch {
+        sendJson(res, 400, { error: 'bad_body', message: '请求体必须是 JSON' });
+        return;
+      }
+      const kind: BotKind | undefined = body.kind === 'personal' || body.kind === 'project' ? body.kind : undefined;
+      if (!kind) {
+        sendJson(res, 400, { error: 'invalid_kind', message: '机器人角色只能是 personal 或 project。' });
+        return;
+      }
+      const personalCwd = kind === 'personal' && typeof body.cwd === 'string' ? await resolvePersonalCwd(body.cwd.trim()) : undefined;
+      if (kind === 'personal' && !personalCwd) {
+        sendJson(res, 400, { error: 'invalid_cwd', message: '个人助理工作目录必须是存在且可访问的绝对路径。' });
+        return;
+      }
+      const id = randomUUID();
+      registrationIntents.set(id, { kind, personalCwd, expiresAt: Date.now() + 15 * 60_000 });
+      sendJson(res, 201, { intentId: id });
+      return;
+    }
     // GET /api/bots/register-qr/stream —— 扫码注册 SSE（启动 registerApp 会话，推
     // qr → status* → done/error 全程）。EventSource 只能 GET，鉴权靠 cookie。
     // 必须排在 /^\/api\/bots\/([^/]+)$/ 的 botMatch 之前（否则 register-qr 被当 appId）。
@@ -337,6 +365,36 @@ export function createWebServer(opts: WebServerOptions): WebServer {
     if (req.method === 'GET' && setupMatch) {
       const status = await opts.service.getSetupStatus(decodeURIComponent(setupMatch[1]!));
       sendJson(res, 200, status);
+      return;
+    }
+
+    const personalUsersMatch = /^\/api\/bots\/([^/]+)\/personal-allowed-users$/.exec(pathName);
+    if (req.method === 'POST' && personalUsersMatch) {
+      let body: Record<string, unknown>;
+      try {
+        body = await readJsonBody(req);
+      } catch {
+        sendJson(res, 400, { error: 'bad_body', message: '请求体必须是 JSON' });
+        return;
+      }
+      if (!Array.isArray(body.users) || body.users.some((user) => typeof user !== 'string')) {
+        sendJson(res, 400, { error: 'invalid_users', message: 'users 必须是 open_id 字符串数组' });
+        return;
+      }
+      try {
+        await opts.service.setPersonalAllowedUsers(decodeURIComponent(personalUsersMatch[1]!), body.users as string[]);
+        sendJson(res, 200, { ok: true });
+      } catch (err) {
+        if (err instanceof AdminWriteError) {
+          sendJson(res, 409, { error: 'rejected', message: err.message });
+          return;
+        }
+        if (err instanceof NotWiredYetError) {
+          sendJson(res, 501, { error: 'not_wired_yet', message: err.message });
+          return;
+        }
+        throw err;
+      }
       return;
     }
 
@@ -631,6 +689,14 @@ export function createWebServer(opts: WebServerOptions): WebServer {
    * keystore，done payload 只回白名单字段（appId/name/tenant/adminOpenId/botName/missingScopes）。
    */
   function handleRegisterQrStream(req: IncomingMessage, res: ServerResponse): void {
+    const intentId = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams.get('intent');
+    const intent = intentId ? registrationIntents.get(intentId) : undefined;
+    if (intentId && (!intent || intent.expiresAt <= Date.now())) {
+      if (intentId) registrationIntents.delete(intentId);
+      sendJson(res, 400, { error: 'invalid_intent', message: '创建意图已过期，请重新填写角色与工作区。' });
+      return;
+    }
+    if (intentId) registrationIntents.delete(intentId); // single-use: profile cannot be replayed by a stale page
     // 抢占式替换：先 abort 旧会话（旧 EventSource 收到 abort 静默关闭），再开新会话。
     qrSession?.abort.abort();
     const abort = new AbortController();
@@ -673,6 +739,8 @@ export function createWebServer(opts: WebServerOptions): WebServer {
         signal: abort.signal,
         onQr: (info) => sendEvent('qr', { qrUrl: info.url, expireIn: info.expireIn, sessionId: session.id }),
         onStatus: (info) => sendEvent('status', { status: info.status, interval: info.interval }),
+        kind: intent?.kind ?? 'project',
+        personalCwd: intent?.personalCwd,
       })
       .then((result) => {
         if (result.ok) {
@@ -683,6 +751,7 @@ export function createWebServer(opts: WebServerOptions): WebServer {
             tenant: result.tenant,
             adminOpenId: result.adminOpenId,
             botName: result.botName,
+            kind: result.kind,
             missingScopes: result.missingScopes,
           });
         } else if (result.code === 'abort') {

@@ -7,6 +7,7 @@ import {
   getRunIdleTimeoutMs,
   isAdmin,
   isChatAllowed,
+  isPersonalUserAllowed,
   isUserAllowed,
   isUserAllowedInProject,
   resolveOwner,
@@ -76,6 +77,14 @@ describe('config schema helpers', () => {
     expect(isAdmin(withAdmin, 'ou_owner')).toBe(true);
     expect(isAdmin(withAdmin, 'ou_a')).toBe(true);
     expect(isAdmin(withAdmin, 'ou_b')).toBe(false);
+  });
+
+  it('personal assistant access is owner-only unless a collaborator is explicitly allowlisted', () => {
+    const personal = cfg({ access: { ownerOpenId: 'ou_owner' }, personal: { allowedUsers: ['ou_guest'] } });
+    expect(isPersonalUserAllowed(personal, 'ou_owner')).toBe(true);
+    expect(isPersonalUserAllowed(personal, 'ou_guest')).toBe(true);
+    expect(isPersonalUserAllowed(personal, 'ou_other')).toBe(false);
+    expect(isPersonalUserAllowed(cfg({ access: { ownerOpenId: 'ou_owner' }, personal: { allowedUsers: [] } }), 'ou_other')).toBe(false);
   });
 
   it('resolveOwner: explicit ownerOpenId, else first admin (老 config 回退)', () => {

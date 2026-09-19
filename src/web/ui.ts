@@ -1827,12 +1827,15 @@ ${UI_PURE_JS}
       nameLink.onclick = function () { go({ tab: 'bot', botId: b.appId }); };
       head.appendChild(nameLink);
       head.appendChild(el('span', 'tag', b.tenant === 'lark' ? 'Lark' : '飞书'));
+      head.appendChild(el('span', 'tag blue', (b.kind || 'project') === 'personal' ? '个人助理' : '项目协作'));
       head.appendChild(el('span', 'tag', b.appId));
       if (b.current) head.appendChild(el('span', 'tag blue', '主'));
       grow.appendChild(head);
       grow.appendChild(el('div', 'note',
         (b.running ? '运行中' + (b.pid ? ' · pid ' + b.pid : '') : '未在运行') +
-        ' · ' + ((b.projects && b.projects.length) || 0) + ' 个项目'));
+        ' · ' + ((b.kind || 'project') === 'personal'
+          ? ((b.personal && b.personal.sessionCount) || 0) + ' 个个人会话'
+          : ((b.projects && b.projects.length) || 0) + ' 个项目'));
       row.appendChild(grow);
       // 已启用 ≠ 已上线：加进活跃集了，但 Feishu Bridge 没在跑就不会真正连上。明确提示别误会。
       if (b.active && daemon && !daemon.running) {
@@ -2062,6 +2065,28 @@ ${UI_PURE_JS}
     headCard.appendChild(hh);
     renderBotOverview(headCard, b);
     root.appendChild(headCard);
+
+    if ((b.kind || 'project') === 'personal') {
+      var personal = el('div', 'card');
+      personal.appendChild(el('h2', null, '🤖 个人助理'));
+      personal.appendChild(el('div', 'note', '此机器人只响应被授权用户的私聊；群消息、项目绑定和云文档评论均不会处理。'));
+      var pmeta = b.personal || {};
+      personal.appendChild(el('div', 'path', '📂 工作区：' + (pmeta.cwd || '未配置')));
+      personal.appendChild(el('div', 'statline', '👥 授权协作者：' + (pmeta.allowedUsersCount || 0) + ' 人 · 🕘 个人会话：' + (pmeta.sessionCount || 0) + ' 个'));
+      if (pmeta.allowedUsers && pmeta.allowedUsers.length) personal.appendChild(el('div', 'note', '已授权：' + pmeta.allowedUsers.join('、')));
+      personal.appendChild(el('div', 'note', '第一版工作区创建后不可在线修改。输入要保留的协作者 open_id（逗号分隔）可更新白名单；owner 始终保留访问权。'));
+      var usersInput = el('input', 'input'); usersInput.placeholder = 'ou_xxx, ou_yyy'; usersInput.value = (pmeta.allowedUsers || []).join(', '); usersInput.setAttribute('aria-label', '个人助理协作者 open_id');
+      personal.appendChild(usersInput);
+      var saveUsers = el('button', 'btn primary sm', '保存白名单');
+      saveUsers.style.marginTop = '8px';
+      saveUsers.onclick = function () {
+        var users = usersInput.value.split(',').map(function (v) { return v.trim(); }).filter(Boolean);
+        postWrite('/api/bots/' + encodeURIComponent(b.appId) + '/personal-allowed-users', { users: users });
+      };
+      personal.appendChild(saveUsers);
+      root.appendChild(personal);
+      return;
+    }
 
     var cols = el('div', 'cols');
     var left = el('div');
@@ -2479,7 +2504,7 @@ ${UI_PURE_JS}
   // ════════════════════════════════════════════════════════════════════════════
   //  ➕ 添加机器人向导（扫码 → checklist → 完成）
   // ════════════════════════════════════════════════════════════════════════════
-  var wizStep = 1;          // 1=扫码 2=checklist 3=完成
+  var wizStep = 1;          // 1=角色/扫码 2=checklist 3=完成
   var wizBotId = null;
   var wizPoll = null;       // setup-status 轮询定时器
   var wizSetup = null;
@@ -2488,6 +2513,8 @@ ${UI_PURE_JS}
   var wizCountdown = null;  // 二维码过期倒计时
   var wizAutoEnabled = false;    // 新 bot 是否已自动加入活跃集（一次性）
   var wizRestartPrompted = false; // 完成步是否已弹过「重启拉起」确认（一次性）
+  var wizKind = 'project';
+  var wizPersonalCwd = '';
 
   // 添加机器人是写操作：Feishu Bridge 没在跑时控制台为只读，不能加（与「没启动只读」一致）。
   // 没在跑就引导先启动，而不是打开向导让用户扫码后再被 501 挡回。
@@ -2505,7 +2532,7 @@ ${UI_PURE_JS}
   }
 
   function openWizard() {
-    wizStep = 1; wizBotId = null; wizSetup = null;
+    wizStep = 1; wizBotId = null; wizSetup = null; wizKind = 'project'; wizPersonalCwd = '';
     wizAutoEnabled = false; wizRestartPrompted = false;
     stopWizPoll(); stopWizQr();
     $('wizMask').classList.add('open');
@@ -2530,7 +2557,7 @@ ${UI_PURE_JS}
 
   function wizStepBar(active) {
     var bar = el('div', 'steps');
-    ['① 扫码创建', '② 接入检测', '③ 完成'].forEach(function (lab, i) {
+    ['① 角色与扫码', '② 接入检测', '③ 完成'].forEach(function (lab, i) {
       var n = i + 1;
       bar.appendChild(el('div', 'step' + (n === active ? ' on' : (n < active ? ' done' : '')), lab));
     });
@@ -2548,17 +2575,32 @@ ${UI_PURE_JS}
     var w = $('wizBody');
     w.textContent = '';
     w.appendChild(el('h3', null, '➕ 添加机器人'));
-    w.appendChild(el('div', 'note', '用飞书 App 扫一下二维码 —— 创建或复用应用、拿密钥入库，并自动将你设为管理员。'));
+    w.appendChild(el('div', 'note', '先选择机器人角色。个人助理只接收私聊；项目协作保持项目群和话题能力。扫码后密钥会直接进入本机加密库。'));
     w.appendChild(wizStepBar(1));
+
+    var form = el('div', 'form');
+    var kindLabel = el('label', null, '机器人角色');
+    var kind = document.createElement('select'); kind.className = 'input';
+    [['project', '项目协作（群项目 / 话题）'], ['personal', '个人助理（仅私聊）']].forEach(function (row) {
+      var o = document.createElement('option'); o.value = row[0]; o.textContent = row[1]; kind.appendChild(o);
+    });
+    kind.value = wizKind;
+    kindLabel.appendChild(kind); form.appendChild(kindLabel);
+    var cwdLabel = el('label', null, '个人工作目录（仅个人助理）'); cwdLabel.id = 'wizCwdLabel';
+    var cwd = document.createElement('input'); cwd.className = 'input'; cwd.placeholder = '/Users/me/workspace'; cwd.value = wizPersonalCwd;
+    cwdLabel.appendChild(cwd); form.appendChild(cwdLabel);
+    function syncKind() { wizKind = kind.value; cwdLabel.style.display = wizKind === 'personal' ? '' : 'none'; }
+    kind.onchange = syncKind; cwd.oninput = function () { wizPersonalCwd = cwd.value; }; syncKind();
+    w.appendChild(form);
 
     var qrWrap = el('div', 'qrbox');
     qrWrap.id = 'wizQrWrap';
-    qrWrap.appendChild(el('div', 'note', '正在生成二维码…'));
+    qrWrap.appendChild(el('div', 'note', '选择角色后生成二维码。'));
     w.appendChild(qrWrap);
 
     var steps = el('div', 'note');
     steps.style.cssText = 'margin-top:6px;line-height:1.7';
-    steps.textContent = '① 用飞书 App 扫码 → ② 在飞书里点「创建并授权」 → ③ 回到本页（无需手动刷新），创建成功会自动进入第②步「接入检测」。';
+    steps.textContent = '① 填好角色与工作区 → ② 生成二维码并在飞书里确认创建 → ③ 回到本页（无需手动刷新），创建成功会自动进入第②步「接入检测」。';
     w.appendChild(steps);
 
     var statusLine = el('div', 'note'); statusLine.id = 'wizScanStatus';
@@ -2566,18 +2608,30 @@ ${UI_PURE_JS}
     w.appendChild(statusLine);
 
     var actions = el('div', 'actions');
+    var begin = el('button', 'btn primary', '生成二维码');
+    begin.onclick = function () { wizPersonalCwd = cwd.value; startWizQr(); };
+    actions.appendChild(begin);
     var cancel = el('button', 'btn', '取消');
     cancel.onclick = closeWizard;
     actions.appendChild(cancel);
     w.appendChild(actions);
 
-    startWizQr();
   }
 
   // 扫码 SSE：EventSource /api/bots/register-qr/stream → qr / status / done / error。
   function startWizQr() {
     stopWizQr();
-    var es = new EventSource('/api/bots/register-qr/stream');
+    var wrap = $('wizQrWrap'); if (wrap) { wrap.textContent = ''; wrap.appendChild(el('div', 'note', '正在校验本机工作目录并生成二维码…')); }
+    fetch('/api/bots/register-intents', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: wizKind, cwd: wizPersonalCwd })
+    }).then(function (r) { return r.json().then(function (body) { if (!r.ok) throw new Error(body.message || '无法创建注册意图'); return body; }); })
+      .then(function (intent) { openWizQrStream(intent.intentId); })
+      .catch(function (err) { renderWizQrError(err && err.message ? err.message : '无法校验角色或工作目录'); });
+  }
+
+  function openWizQrStream(intentId) {
+    var es = new EventSource('/api/bots/register-qr/stream?intent=' + encodeURIComponent(intentId));
     wizEs = es;
     es.addEventListener('qr', function (ev) {
       var info; try { info = JSON.parse(ev.data); } catch (e) { return; }

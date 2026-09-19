@@ -10,6 +10,7 @@ import {
   performSetAutoCompact,
   performSetCompletionReminder,
   performSetNoMention,
+  performSetPersonalAllowedUsers,
   performSetPermissionMode,
   performSetSenderIdentity,
   probeBackends as opsProbeBackends,
@@ -279,6 +280,25 @@ describe('performSetSenderIdentity', () => {
 
     expect(r).toEqual({ ok: true, senderIdentityEnabled: false });
     expect(cfg.preferences).toEqual({ showToolCalls: true, includeSenderIdentity: false });
+    expect(persist).toHaveBeenCalledOnce();
+  });
+});
+
+describe('performSetPersonalAllowedUsers', () => {
+  it('deduplicates collaborators, preserves the workspace, and never persists the implicit owner', async () => {
+    const cfg: AppConfig = {
+      accounts: { app: { id: 'cli_personal', secret: 'secret', tenant: 'feishu' } },
+      preferences: { access: { ownerOpenId: 'ou_owner' }, personal: { cwd: '/workspace', allowedUsers: ['ou_old'] } },
+    };
+    const persist = vi.fn(async () => undefined);
+    const r = await performSetPersonalAllowedUsers({
+      cfg,
+      users: ['ou_guest', 'ou_owner', 'ou_guest', '  ou_two  '],
+      writePreferences: createAppPreferencesWriter({ cfg, persistConfig: persist }),
+    });
+
+    expect(r).toEqual({ ok: true, personalAllowedUsers: ['ou_guest', 'ou_two'] });
+    expect(cfg.preferences?.personal).toEqual({ cwd: '/workspace', allowedUsers: ['ou_guest', 'ou_two'] });
     expect(persist).toHaveBeenCalledOnce();
   });
 });

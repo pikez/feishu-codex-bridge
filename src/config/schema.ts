@@ -90,6 +90,15 @@ export interface AppAccess {
   allowedChats?: string[];
 }
 
+/** Per-bot settings used only by a `personal` BotKind. The owner is implicit;
+ * allowedUsers stores additional, trusted private-chat users. */
+export interface PersonalBotPreferences {
+  /** Canonical absolute directory passed to Codex for every personal session. */
+  cwd?: string;
+  /** Additional private-chat users. The owner never needs to be stored here. */
+  allowedUsers?: string[];
+}
+
 export interface AppPreferences {
   /** 空白项目的默认父目录。仅通过 config.json 配置；缺省时仍使用
    * `~/.feishu-codex-bridge/projects`。支持绝对路径或 `~` 开头的路径。 */
@@ -118,6 +127,8 @@ export interface AppPreferences {
   requireMentionInGroup?: boolean;
   /** access control — see AppAccess. */
   access?: AppAccess;
+  /** Personal-assistant settings. Ignored by project bots. */
+  personal?: PersonalBotPreferences;
   /** SIGTERM→SIGKILL grace (ms) for the app-server child. Default 5000. */
   agentStopGraceMs?: number;
   /** local Claude Code / Codex CLI bridge — see {@link CliBridgePreferences}. */
@@ -358,6 +369,14 @@ export function isAdmin(cfg: AppConfig, senderId: string): boolean {
   if (!senderId) return false;
   if (senderId === resolveOwner(cfg)) return true;
   return Boolean(cfg.preferences?.access?.admins?.includes(senderId));
+}
+
+/** Owner is always permitted; every other personal-chat user must be explicitly
+ * allowlisted. Empty/absent lists intentionally do not mean public access. */
+export function isPersonalUserAllowed(cfg: AppConfig, senderId: string): boolean {
+  if (!senderId) return false;
+  if (senderId === resolveOwner(cfg)) return true;
+  return Boolean(cfg.preferences?.personal?.allowedUsers?.includes(senderId));
 }
 
 /** True when `senderId` may make the bot respond in a project group. admin/owner

@@ -73,6 +73,9 @@ function stubService(): AdminService {
     async setSenderIdentity() {
       throw new NotWiredYetError('🪪 发信人身份上下文');
     },
+    async setPersonalAllowedUsers() {
+      throw new NotWiredYetError('👥 个人助理白名单');
+    },
     async doctorBackends() {
       return [{ id: 'codex-appserver', name: 'Codex', ok: true, version: '1.0.0', isDefault: true }];
     },

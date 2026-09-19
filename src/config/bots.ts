@@ -4,6 +4,9 @@ import { dirname, join } from 'node:path';
 import { paths, botDir } from './paths';
 import { loadConfig } from './store';
 import { isComplete, type TenantBrand } from './schema';
+import { DEFAULT_BOT_KIND, normalizeBotKind, type BotKind } from './bot-kind';
+
+export type { BotKind } from './bot-kind';
 
 /** One saved bot. Credentials' secret lives in the keystore (key `app-<appId>`). */
 export interface BotEntry {
@@ -13,6 +16,8 @@ export interface BotEntry {
   tenant: TenantBrand;
   /** bot display name from credential validation (best-effort, for `bots` list) */
   botName?: string;
+  /** Local behavior profile. v1 entries omit it and normalize to `project`. */
+  kind?: BotKind;
   createdAt: number;
   /**
    * Whether `run` / `start` brings this bot up. The active set is multi-select
@@ -25,7 +30,8 @@ export interface BotEntry {
 }
 
 export interface BotsRegistry {
-  version: 1;
+  /** v1 is accepted on input; every write emits v2. */
+  version: 1 | 2;
   /**
    * Primary bot's appId — kept in sync with the active set (first active bot)
    * for the single-bot code paths (doctor, the implicit no-selector `run`,
@@ -36,13 +42,16 @@ export interface BotsRegistry {
   bots: BotEntry[];
 }
 
-const EMPTY: BotsRegistry = { version: 1, bots: [] };
+const EMPTY: BotsRegistry = { version: 2, bots: [] };
 
 export async function loadBots(): Promise<BotsRegistry> {
   try {
     const text = await readFile(paths.botsFile, 'utf8');
     const reg = JSON.parse(text) as BotsRegistry;
-    return { version: 1, current: reg.current, bots: Array.isArray(reg.bots) ? reg.bots : [] };
+    const bots = Array.isArray(reg.bots)
+      ? reg.bots.map((entry) => ({ ...entry, kind: normalizeBotKind(entry?.kind) }))
+      : [];
+    return { version: 2, current: reg.current, bots };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { ...EMPTY };
     throw err;
@@ -80,9 +89,9 @@ export async function ensureRegistry(): Promise<BotsRegistry> {
   }
 
   const reg: BotsRegistry = {
-    version: 1,
+    version: 2,
     current: appId,
-    bots: [{ name: 'default', appId, tenant, createdAt: nowMs() }],
+    bots: [{ name: 'default', appId, tenant, kind: DEFAULT_BOT_KIND, createdAt: nowMs() }],
   };
   await saveBots(reg);
   return reg;
@@ -133,7 +142,7 @@ export async function setActiveBots(appIds: string[]): Promise<BotsRegistry> {
 export async function addBot(entry: BotEntry): Promise<BotsRegistry> {
   const reg = await loadBots();
   reg.bots = reg.bots.filter((b) => b.appId !== entry.appId);
-  reg.bots.push(entry);
+  reg.bots.push({ ...entry, kind: normalizeBotKind(entry.kind) });
   if (!reg.current) reg.current = entry.appId;
   await saveBots(reg);
   return reg;

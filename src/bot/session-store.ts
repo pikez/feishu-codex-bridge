@@ -11,7 +11,8 @@ import { DEFAULT_BACKEND_ID, type ReasoningEffort } from '../agent/types';
  * model/effort overrides stick.
  */
 export interface SessionRecord {
-  /** Feishu topic thread_id (the key) */
+  /** Opaque bridge binding key. Project sessions use a Feishu topic/chat id;
+   * personal sessions use `personal:<openId>:<uuid>`. */
   threadId: string;
   chatId: string;
   cwd: string;
@@ -35,6 +36,12 @@ export interface SessionRecord {
   lastSeenAt?: number;
   createdAt: number;
   updatedAt: number;
+  /** Present only for a direct-chat personal conversation. */
+  personalUserId?: string;
+  /** Stable virtual conversation id, useful for diagnostics and future UI. */
+  personalConversationId?: string;
+  /** Optional user-supplied label from `/new <title>`. */
+  personalTitle?: string;
 }
 
 export type SessionTitlePhase =
@@ -95,11 +102,13 @@ interface StoreFile {
   version: number;
   sessions: SessionRecord[];
   titleJobs: SessionTitleJob[];
+  /** Per-user selected personal conversation. Keys are open_ids. */
+  personalActiveByUser: Record<string, string>;
 }
 
 // v3：在 sessions 绑定外新增按 backend+sessionId 去重的持久 titleJobs。
 // 旧 v1/v2 读入时 titleJobs=[]，不静默回填历史会话。
-const FILE_VERSION = 3;
+const FILE_VERSION = 4;
 
 /** v1 文件的旧字段名（`codexThread` + `Id`）。拼接而非字面量，是为了让「全链改名
  * 后 grep 旧名 = 0」的判据可机械验证 —— 这里是全仓唯一还认得旧名的地方。 */
@@ -119,7 +128,7 @@ function migrate(raw: Record<string, unknown>): SessionRecord {
 }
 
 function emptyStore(): StoreFile {
-  return { version: FILE_VERSION, sessions: [], titleJobs: [] };
+  return { version: FILE_VERSION, sessions: [], titleJobs: [], personalActiveByUser: {} };
 }
 
 async function readStoreIn(file: string): Promise<StoreFile> {
@@ -135,7 +144,15 @@ async function readStoreIn(file: string): Promise<StoreFile> {
       typeof parsed.version === 'number' && parsed.version >= 3 && Array.isArray(parsed.titleJobs)
         ? (parsed.titleJobs as SessionTitleJob[])
         : [];
-    return { version: FILE_VERSION, sessions, titleJobs };
+    const personalActiveByUser: Record<string, string> =
+      typeof parsed.version === 'number' && parsed.version >= 4 && parsed.personalActiveByUser && typeof parsed.personalActiveByUser === 'object'
+        ? (Object.fromEntries(
+            Object.entries(parsed.personalActiveByUser as Record<string, unknown>).filter(
+              ([userId, key]) => typeof userId === 'string' && typeof key === 'string',
+            ),
+          ) as Record<string, string>)
+        : {};
+    return { version: FILE_VERSION, sessions, titleJobs, personalActiveByUser };
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return emptyStore();
     throw err;
@@ -169,7 +186,12 @@ function withLock<T>(fn: () => Promise<T>): Promise<T> {
 async function write(store: StoreFile): Promise<void> {
   await mkdir(dirname(paths.sessionsFile), { recursive: true });
   const tmp = `${paths.sessionsFile}.tmp-${process.pid}-${randomUUID()}`;
-  const body: StoreFile = { version: FILE_VERSION, sessions: store.sessions, titleJobs: store.titleJobs };
+  const body: StoreFile = {
+    version: FILE_VERSION,
+    sessions: store.sessions,
+    titleJobs: store.titleJobs,
+    personalActiveByUser: store.personalActiveByUser,
+  };
   await writeFile(tmp, `${JSON.stringify(body, null, 2)}\n`, 'utf8');
   await rename(tmp, paths.sessionsFile);
 }
@@ -182,6 +204,33 @@ export async function getSession(threadId: string): Promise<SessionRecord | unde
   return (await read()).sessions.find((s) => s.threadId === threadId);
 }
 
+/** List only one private-chat user's own conversations, newest first. */
+export async function listPersonalSessions(userId: string): Promise<SessionRecord[]> {
+  return (await read()).sessions
+    .filter((s) => s.personalUserId === userId)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+/** Resolve a user's persisted current personal conversation. Stale pointers are
+ * ignored rather than exposing another user's session. */
+export async function getActivePersonalSession(userId: string): Promise<SessionRecord | undefined> {
+  const store = await read();
+  const key = store.personalActiveByUser[userId];
+  return key ? store.sessions.find((s) => s.threadId === key && s.personalUserId === userId) : undefined;
+}
+
+/** Atomically choose one of the caller's own personal conversations. */
+export async function setActivePersonalSession(userId: string, threadId: string): Promise<boolean> {
+  return withLock(async () => {
+    const store = await read();
+    const rec = store.sessions.find((s) => s.threadId === threadId);
+    if (!rec || rec.personalUserId !== userId) return false;
+    store.personalActiveByUser[userId] = threadId;
+    await write(store);
+    return true;
+  });
+}
+
 /** Insert or replace a session by threadId. */
 export async function upsertSession(rec: SessionRecord): Promise<void> {
   return withLock(async () => {
@@ -189,6 +238,11 @@ export async function upsertSession(rec: SessionRecord): Promise<void> {
     const idx = store.sessions.findIndex((s) => s.threadId === rec.threadId);
     if (idx === -1) store.sessions.push(rec);
     else store.sessions[idx] = rec;
+    // A newly created/recreated personal binding becomes that user's selected
+    // conversation in the SAME atomic write. This prevents a crash between the
+    // session record and its active pointer from silently creating a second
+    // personal thread on the next DM.
+    if (rec.personalUserId) store.personalActiveByUser[rec.personalUserId] = rec.threadId;
     await write(store);
   });
 }

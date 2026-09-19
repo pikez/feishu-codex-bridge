@@ -47,6 +47,7 @@ import {
   shouldShowCompletionReminderButton,
   isAdmin,
   isChatAllowed,
+  isPersonalUserAllowed,
   isUserAllowedInProject,
   resolveOwner,
   RUN_IDLE_TIMEOUT_MAX_SEC,
@@ -188,14 +189,20 @@ import { refreshBranch } from '../project/announcement';
 import { leaveChat, transferOwnership } from '../project/group-ops';
 import {
   clearSessionTitleJobKey,
+  getActivePersonalSession,
   getSession,
+  listPersonalSessions,
   listSessions,
   patchSession,
+  setActivePersonalSession,
   sessionTitleJobKey,
   upsertSession,
   type SessionRecord,
   type SessionTitlePolicySnapshot,
 } from './session-store';
+import { newPersonalSessionKey, resolvePersonalCwd } from './personal';
+import { routePersonalSession } from './session-routing';
+import { normalizeBotKind, type BotKind } from '../config/bot-kind';
 import { SessionTitleCoordinator } from './session-title-coordinator';
 import {
   sessionTitleSourceFromMessage,
@@ -651,7 +658,9 @@ export function createOrchestrator(
   cfg: AppConfig,
   fallbackCwd: string,
   cliBridge?: CliBridgeRuntimeHooks,
+  botKind: BotKind = 'project',
 ): Orchestrator {
+  const kind = normalizeBotKind(botKind);
   /** Lazily-constructed backends by id — one instance per backend for the whole
    * bridge (mirrors the old single-instance shape; codex stays the default). */
   const backends = new Map<string, AgentBackend>();
@@ -891,6 +900,10 @@ export function createOrchestrator(
     });
 
     if (msg.chatType === 'p2p') {
+      if (kind === 'personal') {
+        await handlePersonalDirectMessage(msg);
+        return;
+      }
       // 本地 CLI Stop 续聊：owner 在私聊里回复任务完成卡 → 把文本喂回本地 agent。
       // 必须抢在 handleDmConsole（任意 p2p 消息都会弹菜单卡）之前；命中即不再下传。
       if (cliBridge?.onMessage({
@@ -904,6 +917,10 @@ export function createOrchestrator(
       await handleDmConsole(channel, cfg, msg);
       return;
     }
+
+    // A personal assistant deliberately has no group surface. In particular it
+    // must never disclose its local workspace through an @ reply in a group.
+    if (kind === 'personal') return;
 
     const project = await getProjectByChatId(msg.chatId);
     // @门：没 @ 时只在「项目群 + 免@ 适用」才响应。免@默认开,但 multi 仅话题内、
@@ -1108,10 +1125,11 @@ export function createOrchestrator(
   };
 
   /** Parse a leading slash command; null otherwise. */
-  function parseCommand(text: string): 'resume' | 'model' | 'settings' | 'help' | 'compact' | 'context' | 'clear' | null {
+  function parseCommand(text: string): 'new' | 'resume' | 'model' | 'settings' | 'help' | 'compact' | 'context' | 'clear' | null {
     const m = /^\/(\w+)/.exec(text);
     const name = m?.[1]?.toLowerCase();
-    return name === 'resume' ||
+    return name === 'new' ||
+      name === 'resume' ||
       name === 'model' ||
       name === 'settings' ||
       name === 'help' ||
@@ -1120,6 +1138,217 @@ export function createOrchestrator(
       name === 'clear'
       ? name
       : null;
+  }
+
+  /** Personal private-chat adapter. It intentionally produces the same
+   * `sessionKey + cwd + permission` shape as group routing, then reuses the
+   * standard queue, streaming cards, media ingest and Codex recovery path. */
+  async function handlePersonalDirectMessage(msg: NormalizedMessage): Promise<void> {
+    if (!isPersonalUserAllowed(cfg, msg.senderId)) {
+      await channel
+        .send(msg.chatId, { markdown: '⚠️ 你还没有被授权使用这位个人助理。' }, { replyTo: msg.messageId })
+        .catch(() => undefined);
+      log.info('intake', 'personal-denied', { op: msg.senderId.slice(-6) });
+      return;
+    }
+    // Fail closed if the configured local directory was removed or unmounted.
+    const cwd = await resolvePersonalCwd(cfg.preferences?.personal?.cwd);
+    if (!cwd) {
+      await channel
+        .send(msg.chatId, { markdown: '⚠️ 个人助理的工作目录当前不可用，已拒绝执行。请让 owner 检查配置。' }, { replyTo: msg.messageId })
+        .catch(() => undefined);
+      log.warn('intake', 'personal-cwd-invalid', { op: msg.senderId.slice(-6) });
+      return;
+    }
+
+    const text = msg.content.trim();
+    const cmd = parseCommand(text);
+    const activeSession = await getActivePersonalSession(msg.senderId);
+    const isRunning = Boolean(activeSession && active.get(activeSession.threadId));
+    const owner = msg.senderId === resolveOwner(cfg);
+    const route = routePersonalSession({
+      userId: msg.senderId,
+      ownerId: resolveOwner(cfg),
+      cwd,
+      activeSessionKey: activeSession?.threadId,
+    });
+    const perm: TurnPerm = {
+      mode: route.mode,
+      network: route.network,
+      cwd: route.cwd,
+    };
+
+    const whitelistChange = /^\/(allow|disallow)\s+(\S+)\s*$/i.exec(text);
+    if (whitelistChange) {
+      if (!owner) {
+        await channel.send(msg.chatId, { markdown: '⚠️ 仅 owner 能管理个人助理白名单。' }, { replyTo: msg.messageId }).catch(() => undefined);
+        return;
+      }
+      const action = whitelistChange[1]!.toLowerCase();
+      const userId = whitelistChange[2]!;
+      if (userId === resolveOwner(cfg)) {
+        await channel.send(msg.chatId, { markdown: 'ℹ️ owner 始终拥有访问权，不能从白名单移除。' }, { replyTo: msg.messageId }).catch(() => undefined);
+        return;
+      }
+      await writePreferences((preferences) => {
+        const personal = preferences.personal ?? { cwd };
+        const users = new Set(personal.allowedUsers ?? []);
+        if (action === 'allow') users.add(userId);
+        else users.delete(userId);
+        preferences.personal = { ...personal, cwd: personal.cwd ?? cwd, allowedUsers: [...users] };
+      });
+      if (action === 'disallow') await evictPersonalUserSessions(userId);
+      await channel
+        .send(msg.chatId, { markdown: action === 'allow' ? `✅ 已授权 \`${userId}\` 使用个人助理。` : `✅ 已移除 \`${userId}\` 的访问权，并关闭其本地会话。` }, { replyTo: msg.messageId })
+        .catch(() => undefined);
+      return;
+    }
+
+    if (cmd === 'help') {
+      await channel
+        .send(
+          msg.chatId,
+          { markdown: '🤖 **个人助理**\n\n直接发文字、图片或文件即可继续当前会话。\n`/new [标题]` 新建会话；`/resume` 查看并切换自己的历史；`/model`、`/compact`、`/context` 可调整当前会话。' },
+          { replyTo: msg.messageId },
+        )
+        .catch(() => undefined);
+      return;
+    }
+    if (cmd === 'settings') {
+      if (!owner) {
+        await channel.send(msg.chatId, { markdown: '⚠️ `/settings` 仅个人助理 owner 可用。' }, { replyTo: msg.messageId }).catch(() => undefined);
+      } else {
+        const users = cfg.preferences?.personal?.allowedUsers ?? [];
+        await channel
+          .send(
+            msg.chatId,
+            { markdown: `⚙️ **个人助理设置**\n\n工作区：\`${cwd}\`\n已授权协作者：${users.length ? users.map((id) => `\`${id}\``).join('、') : '无'}\n\n用 \`/allow <open_id>\` 授权，\`/disallow <open_id>\` 移除。owner 始终保留访问权；工作区创建后不可在线修改。` },
+            { replyTo: msg.messageId },
+          )
+          .catch(() => undefined);
+      }
+      return;
+    }
+    if (cmd === 'new') {
+      if (isRunning) {
+        await channel.send(msg.chatId, { markdown: '⏳ 当前会话仍在运行，请等待结束或先终止后再新建。' }, { replyTo: msg.messageId }).catch(() => undefined);
+        return;
+      }
+      const title = /^\/new\s+(.+?)\s*$/i.exec(text)?.[1]?.trim();
+      await createPersonalConversation(msg, cwd, perm, title);
+      return;
+    }
+    if (cmd === 'resume') {
+      const target = /^\/resume\s+(\d+)\s*$/i.exec(text)?.[1];
+      if (!target) {
+        await postPersonalResumeList(msg);
+        return;
+      }
+      if (isRunning) {
+        await channel.send(msg.chatId, { markdown: '⏳ 当前会话仍在运行，请等待结束或先终止后再切换。' }, { replyTo: msg.messageId }).catch(() => undefined);
+        return;
+      }
+      const sessionsForUser = await listPersonalSessions(msg.senderId);
+      const selected = sessionsForUser[Number(target) - 1];
+      if (!selected || !(await setActivePersonalSession(msg.senderId, selected.threadId))) {
+        await channel.send(msg.chatId, { markdown: '⚠️ 未找到该个人会话，请先发送 `/resume` 查看列表。' }, { replyTo: msg.messageId }).catch(() => undefined);
+        return;
+      }
+      await channel
+        .send(msg.chatId, { markdown: `↩️ 已切换到会话：**${personalSessionLabel(selected)}**。直接发消息继续。` }, { replyTo: msg.messageId })
+        .catch(() => undefined);
+      return;
+    }
+    if (!activeSession) {
+      handleTurn(msg, text, route.sessionKey, true, undefined, {
+        ...perm,
+        personal: { userId: msg.senderId },
+      });
+      return;
+    }
+    if (cmd === 'model') {
+      postModelCard(msg, activeSession.threadId, false);
+      return;
+    }
+    if (cmd === 'compact') {
+      runCompact(msg, activeSession.threadId, false, perm);
+      return;
+    }
+    if (cmd === 'context') {
+      await postContextCard(msg, activeSession.threadId, false);
+      return;
+    }
+    handleTurn(msg, text, activeSession.threadId, true, undefined, perm);
+  }
+
+  function personalSessionLabel(rec: SessionRecord): string {
+    return rec.personalTitle?.trim() || rec.summary.trim() || '未命名会话';
+  }
+
+  async function postPersonalResumeList(msg: NormalizedMessage): Promise<void> {
+    const records = await listPersonalSessions(msg.senderId);
+    const lines = records.slice(0, 20).map((rec, index) => `${index + 1}. **${personalSessionLabel(rec)}** · ${new Date(rec.updatedAt).toLocaleString('zh-CN')}`);
+    await channel
+      .send(
+        msg.chatId,
+        { markdown: lines.length ? `🕘 **你的个人会话**\n\n${lines.join('\n')}\n\n发送 \`/resume 编号\` 切换。` : '🕘 你还没有保存的个人会话。直接发消息即可开始。' },
+        { replyTo: msg.messageId },
+      )
+      .catch(() => undefined);
+  }
+
+  async function createPersonalConversation(
+    msg: NormalizedMessage,
+    cwd: string,
+    perm: TurnPerm,
+    title?: string,
+  ): Promise<void> {
+    let spawned: AgentThread | undefined;
+    try {
+      const key = newPersonalSessionKey(msg.senderId);
+      const be = backendFor();
+      const thread = await be.startThread({ cwd, mode: perm.mode, network: perm.network });
+      spawned = thread;
+      const now = Date.now();
+      await upsertSession({
+        threadId: key,
+        chatId: msg.chatId,
+        cwd,
+        sessionId: thread.sessionId,
+        backend: be.id,
+        summary: title || '新会话',
+        personalUserId: msg.senderId,
+        personalConversationId: key.slice(`personal:${msg.senderId}:`.length),
+        ...(title ? { personalTitle: title } : {}),
+        createdAt: now,
+        updatedAt: now,
+      });
+      trackSession(key, thread);
+      await channel
+        .send(msg.chatId, { markdown: `✨ 已新建${title ? `会话：**${title}**` : '个人会话'}。直接发消息开始。` }, { replyTo: msg.messageId })
+        .catch(() => undefined);
+    } catch (err) {
+      // The durable binding is the commit point. A failed write must not leave
+      // an unreachable app-server process behind.
+      void spawned?.close().catch(() => undefined);
+      log.fail('intake', err, { phase: 'personal-new' });
+      await channel
+        .send(msg.chatId, { markdown: `❌ 新建会话失败：${err instanceof Error ? err.message : String(err)}` }, { replyTo: msg.messageId })
+        .catch(() => undefined);
+    }
+  }
+
+  async function evictPersonalUserSessions(userId: string): Promise<void> {
+    for (const rec of await listPersonalSessions(userId)) {
+      const running = active.get(rec.threadId);
+      running?.interrupt?.();
+      const live = sessions.get(rec.threadId);
+      if (live) {
+        sessions.delete(rec.threadId);
+        sessionTouchedAt.delete(rec.threadId);
+        void live.close().catch(() => undefined);
+      }
+    }
   }
 
   /** Whether to respond to a non-@ message in a project group (免@ default on).
@@ -1167,7 +1396,16 @@ export function createOrchestrator(
   /** A turn's resolved permission, by sender role. `roleSuffix` is set only when
    * the project splits admin/guest tiers — then the session key is namespaced by
    * it so a guest never shares the admin thread (sandbox + codex history). */
-  type TurnPerm = { mode?: PermissionMode; network?: boolean; autoCompact?: boolean; roleSuffix?: 'admin' | 'guest' };
+  type TurnPerm = {
+    mode?: PermissionMode;
+    network?: boolean;
+    autoCompact?: boolean;
+    /** A personal route's already-validated fixed workspace. */
+    cwd?: string;
+    /** Metadata persisted only for personal direct-chat bindings. */
+    personal?: { userId: string; conversationId?: string; title?: string };
+    roleSuffix?: 'admin' | 'guest';
+  };
 
   /** Pick this sender's tier (admin vs guest) for `project`. */
   function turnPerm(project: Project | undefined, senderId: string): TurnPerm {
@@ -1395,6 +1633,7 @@ export function createOrchestrator(
           mode: perm.mode,
           network: perm.network,
           autoCompact: perm.autoCompact,
+          cwd: perm.cwd,
         }).then((r) => {
           tResolveDone = Date.now();
           return r;
@@ -1434,7 +1673,7 @@ export function createOrchestrator(
         if (!thread) {
           // Unknown session (created before this bridge, or store lost): treat as
           // a fresh session bound to the resolved cwd, on the project's backend.
-          const cwd = project?.cwd ?? fallbackCwd;
+          const cwd = perm.cwd ?? project?.cwd ?? fallbackCwd;
           const be = backendFor(project?.backend);
           thread = await be.startThread({ cwd, mode: perm.mode, network: perm.network, autoCompact: perm.autoCompact });
           trackSession(sessionKey, thread);
@@ -1454,14 +1693,22 @@ export function createOrchestrator(
             // manifest boilerplate + a temp path.
             summary: stripFileTokens(summaryText ?? text).slice(0, 80),
             lastSeenAt: msg.createTime,
+            ...(perm.personal
+              ? {
+                  personalUserId: perm.personal.userId,
+                  personalConversationId: perm.personal.conversationId ?? sessionKey.slice(`personal:${perm.personal.userId}:`.length),
+                  ...(perm.personal.title ? { personalTitle: perm.personal.title } : {}),
+                }
+              : {}),
             createdAt: Date.now(),
             updatedAt: Date.now(),
           });
+          if (perm.personal) await setActivePersonalSession(perm.personal.userId, sessionKey);
         } else if (recreated) {
           // resume 失败后创建的是一个全新的 HOST 会话；它属于升级后的新会话，
           // 应独立登记标题任务（旧 sessionId 的 ledger/标题绝不复用）。
           const be = backendFor(prior?.backend ?? project?.backend);
-          const cwd = project?.cwd ?? prior?.cwd ?? fallbackCwd;
+          const cwd = perm.cwd ?? project?.cwd ?? prior?.cwd ?? fallbackCwd;
           titleJobKey = await registerSessionTitle(be, thread.sessionId, cwd, titleSource);
           // Full replacement drops the old session's titleJobKey even if title
           // registration failed; carrying it across would let a later turn attach
@@ -1560,7 +1807,7 @@ export function createOrchestrator(
   async function resolveThread(
     threadId: string,
     chatId: string,
-    perm?: { mode?: PermissionMode; network?: boolean; autoCompact?: boolean },
+    perm?: { mode?: PermissionMode; network?: boolean; autoCompact?: boolean; cwd?: string },
   ): Promise<{ thread: AgentThread | undefined; recreated: boolean }> {
     const live = sessions.get(threadId);
     if (live) {
@@ -1596,7 +1843,7 @@ export function createOrchestrator(
       return { thread: resumed, recreated: false };
     } catch (err) {
       log.fail('agent', err, { phase: 'resume-on-turn', threadId });
-      const cwd = project?.cwd ?? rec.cwd ?? fallbackCwd;
+      const cwd = perm?.cwd ?? project?.cwd ?? rec.cwd ?? fallbackCwd;
       const fresh = await be.startThread({
         cwd,
         model: rec.model,
@@ -1867,6 +2114,7 @@ export function createOrchestrator(
           mode: perm.mode,
           network: perm.network,
           autoCompact: perm.autoCompact,
+          cwd: perm.cwd,
         });
         if (!thread) {
           await reply('这个会话还没开始，先发条消息聊两句再 `/compact`。');

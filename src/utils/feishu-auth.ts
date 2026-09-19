@@ -1,5 +1,6 @@
 import type { TenantBrand } from '../config/schema';
-import { JOIN_GROUP_SCOPES, REQUIRED_SCOPES } from '../config/scopes';
+import type { BotKind } from '../config/bot-kind';
+import { JOIN_GROUP_SCOPES, requiredScopesFor } from '../config/scopes';
 
 const ENDPOINTS: Record<TenantBrand, string> = {
   feishu: 'https://open.feishu.cn',
@@ -41,6 +42,7 @@ export async function validateAppCredentials(
   appId: string,
   appSecret: string,
   tenant: TenantBrand,
+  kind: BotKind = 'project',
 ): Promise<ValidationResult> {
   const base = ENDPOINTS[tenant];
   let resp: Response;
@@ -72,8 +74,8 @@ export async function validateAppCredentials(
     ok: true,
     botName: info?.bot?.app_name,
     botOpenId: info?.bot?.open_id,
-    missingScopes: missing(REQUIRED_SCOPES),
-    missingJoinScopes: missing(JOIN_GROUP_SCOPES),
+    missingScopes: missing(requiredScopesFor(kind)),
+    ...(kind === 'project' ? { missingJoinScopes: missing(JOIN_GROUP_SCOPES) } : {}),
   };
 }
 

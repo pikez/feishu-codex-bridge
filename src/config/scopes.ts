@@ -1,4 +1,5 @@
 import type { TenantBrand } from './schema';
+import type { BotKind } from './bot-kind';
 
 /**
  * The app-identity scopes this bridge needs (design §9). Single source of
@@ -36,6 +37,20 @@ export const REQUIRED_SCOPES = [
   'im:chat.tabs:write_only', // add the "👈 查看可使用的命令" chat tab on group create
   'cardkit:card:write', // interactive button cards (CardKit entities)
 ] as const;
+
+/** Least-privilege scope set for a private personal assistant. It deliberately
+ * excludes every group/project/document-management capability. */
+export const PERSONAL_REQUIRED_SCOPES = [
+  'im:message.p2p_msg:readonly',
+  'im:message:send_as_bot',
+  'im:message.reactions:write_only',
+  'im:resource',
+  'cardkit:card:write',
+] as const;
+
+export function requiredScopesFor(kind: BotKind): readonly string[] {
+  return kind === 'personal' ? PERSONAL_REQUIRED_SCOPES : REQUIRED_SCOPES;
+}
 
 /**
  * Optional scopes for the cloud-doc comment-reply feature (@bot inside a Feishu
@@ -125,6 +140,10 @@ export const GRANT_SCOPES = [
   ...APP_VERSION_SCOPES,
   ...DISCOVERY_SCOPES,
 ] as const;
+
+export function grantScopesFor(kind: BotKind): readonly string[] {
+  return kind === 'personal' ? PERSONAL_REQUIRED_SCOPES : GRANT_SCOPES;
+}
 
 /**
  * Human-readable Chinese labels per scope token, so the doctor card can show

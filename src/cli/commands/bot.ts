@@ -5,20 +5,29 @@ import { removeSecret } from '../../config/keystore';
 import { secretKeyForApp } from '../../config/schema';
 import { botDir } from '../../config/paths';
 import { checkboxSelect } from '../checkbox';
+import type { BotKind } from '../../config/bot-kind';
 
 /** `bot init [name]` — register an additional feishu app via scan-QR + authorize. */
-export async function runBotInit(name?: string): Promise<void> {
+export async function runBotInit(name?: string, options: { kind?: string; cwd?: string } = {}): Promise<void> {
   // 任一 agent 可用即放行；都无也只告警不阻塞（Web 引导下载）。
   await ensureAnyAgent();
-  const result = await registerNewBot(name);
+  const kind = options.kind === undefined ? undefined : options.kind === 'personal' || options.kind === 'project' ? options.kind : null;
+  if (kind === null) {
+    console.error('✗ `--kind` 只能是 personal 或 project。');
+    process.exitCode = 1;
+    return;
+  }
+  const result = await registerNewBot(name, { kind: kind as BotKind | undefined, personalCwd: options.cwd });
   if (!result) {
     process.exitCode = 1;
     return;
   }
+  const personal = result.bot.kind === 'personal';
   console.log('\n下一步（飞书开放平台后台，需手动一次 https://open.feishu.cn/app ）：');
-  console.log('  1) 事件与回调 → 长连接 → 订阅：im.message.receive_v1 / card.action.trigger / application.bot.menu_v6');
-  console.log('     （可选）「加进已有群」功能再订阅：im.chat.member.bot.added_v1 / im.chat.member.bot.deleted_v1');
-  console.log('     （可选）「表情回复驱动（👍 续轮 / OK 终止）」再订阅：im.message.reaction.created_v1');
+  console.log(personal
+    ? '  1) 事件与回调 → 长连接 → 订阅：im.message.receive_v1 / card.action.trigger / im.message.reaction.created_v1'
+    : '  1) 事件与回调 → 长连接 → 订阅：im.message.receive_v1 / card.action.trigger / application.bot.menu_v6');
+  if (!personal) console.log('     （可选）「加进已有群」功能再订阅：im.chat.member.bot.added_v1 / im.chat.member.bot.deleted_v1');
   console.log('  2) 创建并发布应用版本');
   console.log('\n`bot list` 查看全部；`bot use` 勾选要同时连接的机器人；`run` 前台跑 / `start` 后台常驻。\n');
 }
@@ -34,7 +43,7 @@ export async function runBotList(): Promise<void> {
   console.log('\n已注册的飞书机器人：\n');
   for (const b of reg.bots) {
     const mark = active.has(b.appId) ? '✅' : '⬜';
-    console.log(`${mark} ${b.name.padEnd(16)} ${b.appId}  [${b.tenant}]${b.botName ? `  ${b.botName}` : ''}`);
+    console.log(`${mark} ${b.name.padEnd(16)} ${b.appId}  [${b.tenant}]  ${b.kind === 'personal' ? '个人助理' : '项目协作'}${b.botName ? `  ${b.botName}` : ''}`);
   }
   console.log('\n\x1b[2m`bot use` 勾选要同时连接的机器人，或 `bot use <名> [名…]` 直接指定。\x1b[0m\n');
 }
