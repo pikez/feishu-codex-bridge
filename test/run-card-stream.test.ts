@@ -7,6 +7,11 @@ function frame(answer: string) {
   return card([mdStream(answer, 'answer')], { streaming: true });
 }
 
+/** Keep unit tests fast; production uses the 15-second default. */
+function fastStream(): RunCardStream {
+  return new RunCardStream({ updateIntervalMs: 1 });
+}
+
 /**
  * Minimal fake LarkChannel.rawClient for the streaming pump: records every
  * cardElement.content / card.update / card.settings call; `contentErrs` /
@@ -54,7 +59,7 @@ function fakeChannel(contentErrs: unknown[] = [], updateErrs: unknown[] = []) {
 /** Create the card, establish the pump's baseline, then grow the answer so the
  * pump routes the second frame to the element typewriter (streamElement). */
 async function growAnswer(ch: any): Promise<RunCardStream> {
-  const s = new RunCardStream();
+  const s = fastStream();
   await s.create(ch, 'oc_1', frame('hello'), {});
   s.streamCoalesced(ch, frame('hello'), 'answer'); // baseline (deduped — no push)
   await s.drain();
@@ -94,6 +99,46 @@ describe('RunCardStream.streamElement — streaming_mode recovery', () => {
   });
 });
 
+describe('RunCardStream live-update interval', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('defaults to one live CardKit refresh every 15 seconds', async () => {
+    vi.useFakeTimers();
+    const ch = fakeChannel();
+    const s = new RunCardStream();
+    await s.create(ch, 'oc_default_interval', frame('hello'), {});
+    s.streamCoalesced(ch, frame('hello'), 'answer');
+    await s.drain();
+
+    s.streamCoalesced(ch, frame('hello world'), 'answer');
+    await s.drain();
+    expect(ch.contents).toHaveLength(1);
+
+    s.streamCoalesced(ch, frame('hello world!'), 'answer');
+    const drained = s.drain();
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(ch.contents).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await drained;
+    expect(ch.contents).toHaveLength(2);
+  });
+
+  it('does not make terminal finalization wait for a deferred live frame', async () => {
+    vi.useFakeTimers();
+    const ch = fakeChannel();
+    const s = new RunCardStream();
+    await s.create(ch, 'oc_terminal_interval', frame('hello'), {});
+    s.streamCoalesced(ch, frame('hello'), 'answer');
+    await s.drain();
+    s.streamCoalesced(ch, frame('hello world'), 'answer');
+    await s.drain();
+
+    s.streamCoalesced(ch, frame('hello world!'), 'answer');
+    await s.drainForFinalization();
+    expect(ch.contents).toHaveLength(1);
+  });
+});
+
 // M-4: 终局帧保障 —— 429/99991400 指数退避重试，直到终态卡落地。
 describe('RunCardStream.updateCard — 终局帧保障（M-4）', () => {
   afterEach(() => vi.useRealTimers());
@@ -102,7 +147,7 @@ describe('RunCardStream.updateCard — 终局帧保障（M-4）', () => {
     vi.useFakeTimers();
     // 两种限频形态都识别：HTTP 429（axios status）与业务码 99991400。
     const ch = fakeChannel([], [{ response: { status: 429 } }, { code: 99991400 }]);
-    const s = new RunCardStream();
+    const s = fastStream();
     await s.create(ch, 'oc_m4_rl', frame('hi'), {});
     const done = s.updateCard(ch, frame('terminal'));
     await vi.runAllTimersAsync();
@@ -116,7 +161,7 @@ describe('RunCardStream.updateCard — 终局帧保障（M-4）', () => {
   it('keeps the single 200810-window retry for non-rate-limit errors, then gives up without throwing', async () => {
     vi.useFakeTimers();
     const ch = fakeChannel([], [{ code: 200810 }, { code: 200810 }, { code: 200810 }]);
-    const s = new RunCardStream();
+    const s = fastStream();
     await s.create(ch, 'oc_m4_810', frame('hi'), {});
     const done = s.updateCard(ch, frame('terminal'));
     await vi.runAllTimersAsync();
@@ -147,7 +192,7 @@ describe('RunCardStream.updateCard — 终局帧保障（M-4）', () => {
       return rawUpdate(p);
     };
 
-    const s = new RunCardStream();
+    const s = fastStream();
     await s.create(ch, 'oc_terminal_freeze', frame('initial'), {});
     const repaint = s.updateLiveCard(ch, frame('live repaint'));
     await firstStarted;
@@ -172,7 +217,7 @@ describe('RunCardStream.updateCard — 终局帧保障（M-4）', () => {
 describe('pump — 失败帧不推进基线（M-4）', () => {
   it('re-routes the next frame as a whole-card update after a failed push', async () => {
     const ch = fakeChannel([], [{ code: 500 }]); // 第一笔真实整卡推送失败（非限频）
-    const s = new RunCardStream();
+    const s = fastStream();
     await s.create(ch, 'oc_m4_base', frame('hello'), {});
     s.streamCoalesced(ch, frame('hello'), 'answer'); // 与建卡内容相同 → 去重视为已上卡，基线建立
     await s.drain();
@@ -200,11 +245,11 @@ describe('pump — 失败帧不推进基线（M-4）', () => {
 describe('per-chat 推送共享限速（M-4）', () => {
   afterEach(() => vi.useRealTimers());
 
-  it('two streams in one chat space their pushes at least CHAT_MIN_GAP_MS apart', async () => {
+  it('two streams in one chat space their pushes at least the configured interval apart', async () => {
     vi.useFakeTimers();
     const ch = fakeChannel();
-    const s1 = new RunCardStream();
-    const s2 = new RunCardStream();
+    const s1 = new RunCardStream({ updateIntervalMs: 250 });
+    const s2 = new RunCardStream({ updateIntervalMs: 250 });
     await s1.create(ch, 'oc_m4_shared', frame('a'), {});
     await s2.create(ch, 'oc_m4_shared', frame('b'), {});
     s1.streamCoalesced(ch, frame('a grew'), 'answer');
@@ -221,8 +266,8 @@ describe('per-chat 推送共享限速（M-4）', () => {
   it('streams in different chats do not block each other', async () => {
     vi.useFakeTimers();
     const ch = fakeChannel();
-    const s1 = new RunCardStream();
-    const s2 = new RunCardStream();
+    const s1 = fastStream();
+    const s2 = fastStream();
     await s1.create(ch, 'oc_m4_iso_a', frame('a'), {});
     await s2.create(ch, 'oc_m4_iso_b', frame('b'), {});
     s1.streamCoalesced(ch, frame('a grew'), 'answer');

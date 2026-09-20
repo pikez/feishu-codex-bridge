@@ -39,6 +39,7 @@ import {
   getPendingPolicy,
   getModelDisplay,
   getRunIdleTimeoutMs,
+  getRunCardUpdateIntervalMs,
   getSessionTitleConfig,
   getSessionTitleEfforts,
   getShowToolCalls,
@@ -4182,7 +4183,7 @@ export function createOrchestrator(
     reaction?: RunReaction,
   ): Promise<{ release: () => void; queuedCard?: QueuedCardHandle } | null> {
     if (sema.hasFree()) return { release: await sema.acquire() };
-    const stream = new RunCardStream();
+    const stream = new RunCardStream({ updateIntervalMs: getRunCardUpdateIntervalMs(cfg) });
     let msgId: string | undefined;
     const queueCard = (input: Parameters<typeof buildQueuedCard>[0]) =>
       buildQueuedCard({
@@ -4426,7 +4427,7 @@ export function createOrchestrator(
 
         // CardKit streaming entity: body streams with the native typewriter,
         // ⏹/⚙️ ride whole-card updates — both on one card_id (see RunCardStream).
-        const stream = queuedCard?.stream ?? new RunCardStream();
+        const stream = queuedCard?.stream ?? new RunCardStream({ updateIntervalMs: getRunCardUpdateIntervalMs(cfg) });
         const tCreate = Date.now();
         try {
           if (queuedCard) {
@@ -4557,7 +4558,10 @@ export function createOrchestrator(
         }
         const doneAt = Date.now(); // codex stopped emitting / loop ended
         stopper.dispose(); // 事件流已收尾：撤掉 ⏹ 的 5s 强停兜底定时器
-        await stream.drain(); // flush the last coalesced frame before terminal
+        // The terminal card contains the complete answer. Discard a deferred
+        // intermediate frame instead of making a 15-second refresh interval
+        // delay the visible final result.
+        await stream.drainForFinalization();
         state.interrupt = undefined; // turn done; nothing left to interrupt
         const interrupted = stopper.interrupted();
         // 杀进程恢复锤只留给「真出事」：watchdog 超时，或 ⏹ 后没等到干净收尾
@@ -4874,7 +4878,7 @@ export function createOrchestrator(
      * never produced content (no card was sent) — that's how empty turns vanish. */
     const finalizeCard = async (ctx: GoalTurnCtx | null): Promise<void> => {
       if (!ctx || !ctx.stream || !ctx.cardMsgId) return;
-      await ctx.stream.drain();
+      await ctx.stream.drainForFinalization();
       ctx.render.finalize();
       ctx.rc.rs = ctx.render.snapshot();
       await ctx.stream.updateCard(channel, buildRunCard(ctx.rc));
@@ -4902,7 +4906,7 @@ export function createOrchestrator(
     /** Send this turn's streaming card on first real content (idempotent). */
     const ensureCard = async (ctx: GoalTurnCtx): Promise<void> => {
       if (ctx.stream) return;
-      const stream = new RunCardStream();
+      const stream = new RunCardStream({ updateIntervalMs: getRunCardUpdateIntervalMs(cfg) });
       const cardMsgId = await stream.create(channel, opts.chatId, buildRunCard(ctx.rc), { replyTo, replyInThread });
       ctx.rc.cardKey = cardMsgId;
       ctx.stream = stream;

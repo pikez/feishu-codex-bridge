@@ -119,6 +119,8 @@ export interface AppPreferences {
   maxConcurrentRuns?: number;
   /** per-turn idle watchdog (seconds). 0 = off. Default 120 (on). */
   runIdleTimeoutSeconds?: number;
+  /** Minimum interval (seconds) between live CardKit refreshes. Default 15. */
+  runCardUpdateIntervalSeconds?: number;
   /** new-message-mid-turn behavior. Default 'steer'. */
   pendingPolicy?: PendingPolicy;
   /** 普通群任务的结束提醒；默认只在失败或假死超时时发送。 */
@@ -327,6 +329,12 @@ export function getAgentStopGraceMs(cfg: AppConfig): number {
 export const RUN_IDLE_TIMEOUT_MIN_SEC = 10;
 export const RUN_IDLE_TIMEOUT_MAX_SEC = 3600;
 
+/** Bounds for live CardKit refreshes. Keep a small lower bound so a malformed
+ * config cannot accidentally turn one agent turn into a burst of API writes. */
+export const RUN_CARD_UPDATE_INTERVAL_MIN_SEC = 1;
+export const RUN_CARD_UPDATE_INTERVAL_MAX_SEC = 300;
+export const RUN_CARD_UPDATE_INTERVAL_DEFAULT_SEC = 15;
+
 /**
  * Per-turn idle watchdog in ms. Default 120s, ON. `0` disables. Clamps to
  * [10, 3600] seconds when set.
@@ -337,6 +345,22 @@ export function getRunIdleTimeoutMs(cfg: AppConfig): number | undefined {
   if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return 120_000;
   const clamped = Math.min(Math.max(Math.floor(raw), RUN_IDLE_TIMEOUT_MIN_SEC), RUN_IDLE_TIMEOUT_MAX_SEC);
   return clamped * 1000;
+}
+
+/**
+ * Minimum gap between live CardKit updates. A new card entity is sent
+ * immediately, and forced lifecycle writes (notably the terminal card) bypass
+ * this interval, so a long value does not delay the final answer. Values are
+ * stored in seconds for readability in config.json.
+ */
+export function getRunCardUpdateIntervalMs(cfg: AppConfig): number {
+  const raw = cfg.preferences?.runCardUpdateIntervalSeconds;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return RUN_CARD_UPDATE_INTERVAL_DEFAULT_SEC * 1000;
+  const seconds = Math.min(
+    Math.max(Math.floor(raw), RUN_CARD_UPDATE_INTERVAL_MIN_SEC),
+    RUN_CARD_UPDATE_INTERVAL_MAX_SEC,
+  );
+  return seconds * 1000;
 }
 
 /**

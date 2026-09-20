@@ -4,6 +4,7 @@ import {
   getMessageReplyMode,
   getModelDisplay,
   getPendingPolicy,
+  getRunCardUpdateIntervalMs,
   getRunIdleTimeoutMs,
   isAdmin,
   isChatAllowed,
@@ -45,6 +46,14 @@ describe('config schema helpers', () => {
     expect(getRunIdleTimeoutMs(cfg({ runIdleTimeoutSeconds: 5000 }))).toBe(3_600_000);
     expect(getRunIdleTimeoutMs(cfg({ runIdleTimeoutSeconds: 12.9 }))).toBe(12_000);
     expect(getRunIdleTimeoutMs(cfg({ runIdleTimeoutSeconds: -1 }))).toBe(120_000);
+  });
+
+  it('resolves live card refresh interval with a quota-friendly default and bounds', () => {
+    expect(getRunCardUpdateIntervalMs(cfg())).toBe(15_000);
+    expect(getRunCardUpdateIntervalMs(cfg({ runCardUpdateIntervalSeconds: 4 }))).toBe(4_000);
+    expect(getRunCardUpdateIntervalMs(cfg({ runCardUpdateIntervalSeconds: 0 }))).toBe(1_000);
+    expect(getRunCardUpdateIntervalMs(cfg({ runCardUpdateIntervalSeconds: 999 }))).toBe(300_000);
+    expect(getRunCardUpdateIntervalMs(cfg({ runCardUpdateIntervalSeconds: Number.NaN }))).toBe(15_000);
   });
 
   it('resolves pending policy with steer as the default', () => {

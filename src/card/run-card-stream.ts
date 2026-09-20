@@ -9,9 +9,11 @@ import { isCardIdNotReady } from './managed';
  * streaming_mode=true (see {@link ../card/cards}), which per Feishu's docs
  * exempts ALL card/element APIs from the per-card QPS cap while streaming —
  * this floor just keeps us friendly to the app-level 1000/min·50/s budget
- * (push RTT of hundreds of ms dominates the cadence anyway).
+ * (push RTT of hundreds of ms dominates the cadence anyway). The effective
+ * value is supplied per run from preferences; 15 seconds is deliberately the
+ * conservative default for tenants with monthly API-call quotas.
  */
-const STREAM_THROTTLE_MS = 150;
+export const DEFAULT_RUN_CARD_UPDATE_INTERVAL_MS = 15_000;
 
 /** streaming_mode auto-disabled (Feishu turns it off 10 minutes after it was
  * last enabled) — {@link RunCardStream.streamElement} re-enables and resends. */
@@ -20,17 +22,14 @@ const ERR_STREAMING_OFF = 300309;
 const ERR_SEQ_OUT_OF_ORDER = 300317;
 
 /**
- * Same-chat pacing for ALL pushes (M-4 / audit-02 F7). streaming_mode exempts a
- * card from the per-card QPS cap, but Feishu still enforces a same-chat ~5 QPS
- * budget across the bot's messages/updates; two topics streaming concurrently
- * in one chat at the per-card cadence (~6.6/s each) sustain ~13 QPS → rolling
- * 429s. One pacer per chat, shared by every RunCardStream in that chat, spaces
- * pushes ≥{@link CHAT_MIN_GAP_MS} apart (250ms = 4 QPS, headroom for the chat's
- * non-stream messages); a 429 additionally holds the whole chat's next slot
- * back by {@link RATE_LIMIT_PENALTY_MS}. Waits happen inside the pump coroutine
- * / terminal retry only — event consumption (streamCoalesced) never blocks.
+ * Same-chat pacing for live pushes (M-4 / audit-02 F7). One pacer per chat is
+ * shared by every RunCardStream in that chat, spacing them by the configured
+ * live-update interval. Forced lifecycle writes (notably the terminal card)
+ * bypass it so the user is never kept waiting for a result. A 429 additionally
+ * holds the whole chat's next live slot back by {@link RATE_LIMIT_PENALTY_MS}.
+ * Waits happen inside the pump coroutine only — event consumption
+ * (streamCoalesced) never blocks.
  */
-const CHAT_MIN_GAP_MS = 250;
 const RATE_LIMIT_PENALTY_MS = 1_000;
 /** Terminal-frame retry budget when rate-limited (backoff 1s/2s/4s). */
 const TERMINAL_RL_RETRIES = 3;
@@ -38,12 +37,28 @@ const RL_BACKOFF_BASE_MS = 1_000;
 
 class ChatPacer {
   private nextAt = 0;
-  /** Reserve the chat's next push slot and wait until it opens. */
-  async wait(): Promise<void> {
+  constructor(private minGapMs: number) {}
+  setMinGapMs(minGapMs: number): void {
+    this.minGapMs = minGapMs;
+  }
+  /** Reserve the chat's next push slot and wait until it opens. Returns false
+   * when terminal finalization cancels this card's deferred live write. */
+  async wait(registerWake?: (wake: (() => void) | null) => void): Promise<boolean> {
     const now = Date.now();
     const at = Math.max(now, this.nextAt);
-    this.nextAt = at + CHAT_MIN_GAP_MS;
-    if (at > now) await new Promise((r) => setTimeout(r, at - now));
+    this.nextAt = at + this.minGapMs;
+    if (at <= now) return true;
+    let cancelled = false;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, at - now);
+      registerWake?.(() => {
+        cancelled = true;
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    registerWake?.(null);
+    return !cancelled;
   }
   /** Feishu said 429 — hold the whole chat's next slot back. */
   penalize(): void {
@@ -56,15 +71,17 @@ class ChatPacer {
 
 /** Pacers shared per chat across instances (tiny; idle ones pruned on overflow). */
 const chatPacers = new Map<string, ChatPacer>();
-function pacerFor(chatId: string): ChatPacer {
+function pacerFor(chatId: string, minGapMs: number): ChatPacer {
   let p = chatPacers.get(chatId);
   if (!p) {
     if (chatPacers.size >= 512) {
       const now = Date.now();
       for (const [k, v] of chatPacers) if (v.idle(now)) chatPacers.delete(k);
     }
-    p = new ChatPacer();
+    p = new ChatPacer(minGapMs);
     chatPacers.set(chatId, p);
+  } else {
+    p.setMinGapMs(minGapMs);
   }
   return p;
 }
@@ -82,8 +99,8 @@ function isRateLimited(err: unknown): boolean {
  * cardkit.v1.cardElement.content — the ONLY API streaming_config's typewriter
  * applies to; needs the card's streaming_mode on) or to a whole-card
  * cardkit.v1.card.update (structure changed — full replace, no typewriter).
- * Throttled to STREAM_THROTTLE_MS so growth tracks the model in chunks with
- * zero trailing, and collapsible panels (reasoning / tools) re-render cleanly.
+ * Throttled to the configured update interval so growth tracks the model in
+ * bounded chunks, and collapsible panels (reasoning / tools) re-render cleanly.
  * All updates share one strictly-increasing `seq` — Feishu rejects
  * out-of-order updates.
  *
@@ -92,6 +109,7 @@ function isRateLimited(err: unknown): boolean {
  * streams and carries clickable controls (⏹).
  */
 export class RunCardStream {
+  private readonly updateIntervalMs: number;
   private cardId = '';
   private _messageId = '';
   private seq = 0;
@@ -112,6 +130,8 @@ export class RunCardStream {
   private pending: { card: CardObject; answerEid: string | null } | null = null;
   private pumpChannel: LarkChannel | null = null;
   private pumpPromise: Promise<void> | null = null;
+  /** Cancels the coalescing wait when a terminal card is ready to replace it. */
+  private wakePump: (() => void) | null = null;
   // Baselines for the pump's route decision (structure unchanged + answer grew?).
   private lastStructureSig = '';
   private lastAnswerText = '';
@@ -127,6 +147,10 @@ export class RunCardStream {
   private forcedUpdateTail: Promise<void> = Promise.resolve();
   /** Once terminal finalization starts, reminder/settings repaint is stale. */
   private liveUpdatesFrozen = false;
+
+  constructor(opts: { updateIntervalMs?: number } = {}) {
+    this.updateIntervalMs = Math.max(1, Math.floor(opts.updateIntervalMs ?? DEFAULT_RUN_CARD_UPDATE_INTERVAL_MS));
+  }
 
   get messageId(): string {
     return this._messageId;
@@ -161,6 +185,18 @@ export class RunCardStream {
     if (this.pumpPromise) await this.pumpPromise;
   }
 
+  /**
+   * Stop waiting for a deferred live frame and settle any in-flight request.
+   * The caller's terminal whole-card update already contains the newest answer,
+   * so sending that pending intermediate frame first only wastes one API call
+   * and, with a long configured interval, delays the visible final answer.
+   */
+  async drainForFinalization(): Promise<void> {
+    this.pending = null;
+    this.wakePump?.();
+    if (this.pumpPromise) await this.pumpPromise;
+  }
+
   private async pump(): Promise<void> {
     try {
       while (this.pending && this.pumpChannel) {
@@ -192,11 +228,20 @@ export class RunCardStream {
             this.lastAnswerText = answer ?? '';
           }
         }
-        // RTT (~hundreds of ms) usually spaces pushes on its own; this floor only
-        // bites if a round-trip is unusually fast, keeping us under Feishu's
-        // single-card ~10 ops/sec cap.
-        const gap = STREAM_THROTTLE_MS - (Date.now() - t0);
-        if (this.pending && gap > 0) await new Promise((r) => setTimeout(r, gap));
+        // Keep every live request at least the configured interval apart. During
+        // that wait, incoming agent events overwrite `pending`, so only the
+        // latest frame is sent next.
+        const gap = this.updateIntervalMs - (Date.now() - t0);
+        if (this.pending && gap > 0) {
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, gap);
+            this.wakePump = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+          });
+          this.wakePump = null;
+        }
       }
     } finally {
       this.pumpPromise = null;
@@ -218,7 +263,7 @@ export class RunCardStream {
         path: { card_id: this.cardId, element_id: elementId },
         data: { content, sequence: ++this.seq, uuid: `e_${this.cardId}_${this.seq}` },
       });
-    await this.pacer?.wait();
+    if (this.pacer && !(await this.pacer.wait((wake) => (this.wakePump = wake)))) return false;
     const t0 = Date.now();
     try {
       try {
@@ -274,7 +319,7 @@ export class RunCardStream {
     initialCard: CardObject,
     opts: { replyTo?: string; replyInThread?: boolean },
   ): Promise<string> {
-    this.pacer = pacerFor(chatId); // shared with the chat's other streams
+    this.pacer = pacerFor(chatId, this.updateIntervalMs); // shared with the chat's other streams
     const attempt = async (): Promise<string> => {
       const created = await channel.rawClient.cardkit.v1.card.create({
         data: { type: 'card_json', data: JSON.stringify(initialCard) },
@@ -327,9 +372,9 @@ export class RunCardStream {
     const data = JSON.stringify(fullCard);
     if (data === this.lastContent) return true;
     const now = Date.now();
-    if (!force && now - this.lastPush < STREAM_THROTTLE_MS) return false;
+    if (!force && now - this.lastPush < this.updateIntervalMs) return false;
     this.lastPush = now;
-    await this.pacer?.wait();
+    if (this.pacer && !(await this.pacer.wait((wake) => (this.wakePump = wake)))) return false;
     const t0 = Date.now();
     try {
       await channel.rawClient.cardkit.v1.card.update({
@@ -416,7 +461,6 @@ export class RunCardStream {
       this.lastContent = data;
     };
     for (let i = 0; ; i++) {
-      await this.pacer?.wait();
       try {
         await push();
         return true;
