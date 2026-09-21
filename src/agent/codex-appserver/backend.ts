@@ -156,6 +156,38 @@ function parseGeneratedTitle(text: string): string | undefined {
   return clean;
 }
 
+/** Routing fields carried by the app-server notifications relevant to a run.
+ * Keep this structural rather than enumerating every generated notification:
+ * new per-thread protocol events acquire the same protection automatically. */
+type NotificationScope = {
+  threadId?: unknown;
+  turnId?: unknown;
+  turn?: { id?: unknown };
+  thread?: { id?: unknown };
+};
+
+function notificationScope(notification: ServerNotification): NotificationScope {
+  return notification.params as NotificationScope;
+}
+
+/** Whether a notification belongs to one bridge-owned Codex thread. */
+function belongsToThread(notification: ServerNotification, threadId: string): boolean {
+  const scope = notificationScope(notification);
+  // thread/started is the only routed notification whose id is nested in
+  // `thread`; all turn/item/error/usage events carry the top-level threadId.
+  const id = notification.method === 'thread/started' ? scope.thread?.id : scope.threadId;
+  return id === threadId;
+}
+
+/** The turn named by a notification, if it is turn-scoped. */
+function turnIdOf(notification: ServerNotification): string | undefined {
+  const scope = notificationScope(notification);
+  const id = notification.method === 'turn/started' || notification.method === 'turn/completed'
+    ? scope.turn?.id
+    : scope.turnId;
+  return typeof id === 'string' ? id : undefined;
+}
+
 /**
  * Run one already-connected, ephemeral app-server title thread. Exported only
  * to make the protocol/stream behavior testable without spawning Codex.
@@ -328,10 +360,28 @@ class CodexThread implements AgentThread {
           return;
         }
         if (step.done) return;
+        // A single app-server process can host collaboration sub-agents. Their
+        // notifications use the same transport as this session, but belong to
+        // different threads (and must never render into the Feishu card or end
+        // this parent turn). Do this before mapping: AgentEvent intentionally
+        // omits protocol routing ids, so filtering after mapNotification would
+        // be impossible.
+        if (!belongsToThread(step.value, self.sessionId)) continue;
+
+        // A live bridge session owns only one parent turn. Once its start event
+        // is accepted, ignore any stale/different turn notifications even when
+        // they name the same parent thread. Before turn/started, only that event
+        // is actionable; this prevents a buffered old completion from making a
+        // newly-started run look complete.
+        const notificationTurnId = turnIdOf(step.value);
+        if (step.value.method === 'turn/started') {
+          self.currentTurnId = notificationTurnId;
+        } else if (!self.currentTurnId || (notificationTurnId && notificationTurnId !== self.currentTurnId)) {
+          continue;
+        }
         lastActivityAt = Date.now();
         const ev = mapNotification(step.value);
         if (!ev) continue;
-        if (ev.type === 'turn_started') self.currentTurnId = ev.turnId;
         yield ev;
         if (ev.type === 'done') return;
         if (ev.type === 'error' && !ev.willRetry) return;
@@ -383,6 +433,7 @@ class CodexThread implements AgentThread {
       let armed = false;
       let turnActive = false;
       let goalDone = false; // a terminal goal status was seen; drain the live turn, then stop
+      let activeGoalTurnId: string | undefined;
       while (true) {
         const step = await Promise.race([stream.next(), setFailed]);
         if (step === 'set-failed') {
@@ -390,11 +441,21 @@ class CodexThread implements AgentThread {
           return;
         }
         if (step.done) return;
+        // Goal runs use the same app-server process and therefore need the same
+        // collaboration boundary as ordinary turns. A sub-agent completion is
+        // not the parent goal's completion.
+        if (!belongsToThread(step.value, self.sessionId)) continue;
+        const notificationTurnId = turnIdOf(step.value);
+        if (step.value.method === 'turn/started') {
+          activeGoalTurnId = notificationTurnId;
+          self.currentTurnId = notificationTurnId;
+        } else if (notificationTurnId && notificationTurnId !== activeGoalTurnId) {
+          continue;
+        }
         lastActivityAt = Date.now();
         const ev = mapNotification(step.value);
         if (!ev) continue;
         if (ev.type === 'turn_started') {
-          self.currentTurnId = ev.turnId;
           armed = true; // a real turn for our goal is running
           turnActive = true;
           yield ev;
@@ -402,6 +463,7 @@ class CodexThread implements AgentThread {
         }
         if (ev.type === 'done') {
           turnActive = false;
+          activeGoalTurnId = undefined; // allow Codex to auto-start the next parent turn
           yield ev;
           // The goal is terminal AND its final turn just finished — now stop.
           if (goalDone) return;

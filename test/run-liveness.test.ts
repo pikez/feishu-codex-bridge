@@ -22,8 +22,9 @@ process.stdin.on('data', (d) => {
     if (typeof msg.id !== 'number') continue; // notification — ignore
     if (msg.method === 'turn/start') {
       send({ jsonrpc: '2.0', id: msg.id, result: {} });
+      send({ jsonrpc: '2.0', method: 'turn/started', params: { threadId: 'th_live', turn: { id: 'turn_live' } } });
       setInterval(() => {
-        send({ jsonrpc: '2.0', method: 'item/commandExecution/outputDelta', params: { itemId: 'i1', delta: 'x' } });
+        send({ jsonrpc: '2.0', method: 'item/commandExecution/outputDelta', params: { threadId: 'th_live', turnId: 'turn_live', itemId: 'i1', delta: 'x' } });
       }, 20);
       continue;
     }
@@ -52,9 +53,10 @@ describe.skipIf(process.platform === 'win32')('runStreamed 原始通知刷新 la
       const run = thread.runStreamed({ text: 'go' });
       expect(typeof run.lastActivity).toBe('function');
 
-      // 开始消费（挂起的 next() 让 gen 循环跑起来）；到来的全是 null 映射通知，
-      // 流上不产出任何事件，但活性时钟必须持续前进。
+      // 先消费当前 turn 的启动事件；之后到来的全是 null 映射通知，流上不
+      // 产出任何事件，但活性时钟必须持续前进。
       const iter = run.events[Symbol.asyncIterator]();
+      await expect(iter.next()).resolves.toMatchObject({ value: { type: 'turn_started', turnId: 'turn_live' } });
       const pending = iter.next();
       const before = run.lastActivity!();
       await vi.waitFor(() => expect(run.lastActivity!()).toBeGreaterThan(before));
